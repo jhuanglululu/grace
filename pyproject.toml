@@ -1,0 +1,27 @@
+[project]
+name = "grace"
+version = "0.1.0"
+description = "GRACE — Grouped Residual Attention over Composed dEpth, and a matched baseline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "tokenizers>=0.15",
+    "datasets>=2.18",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["grace"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
