@@ -48,7 +48,7 @@ def test_pool_grows_by_G_per_layer():
     idx = torch.randint(0, cfg.vocab_size, (2, 12))
     x = m.embed(idx)
     pool = x.unsqueeze(2)
-    cos, sin = m._rope(12, idx.device, x.dtype)
+    cos, sin = m._rope(0, 12, idx.device, x.dtype)
     sizes = [pool.shape[2]]
     for layer in m.layers:
         out = layer(pool, cos, sin)

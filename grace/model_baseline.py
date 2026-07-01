@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from .config import BaselineConfig
-from .modules import RMSNorm, SwiGLU, apply_rope, build_rope_cache, causal_sdpa
+from .modules import KVCache, RMSNorm, SwiGLU, apply_rope, attend, build_rope_cache
 
 
 class CausalSelfAttention(nn.Module):
@@ -20,7 +20,7 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, kv: KVCache | None = None):
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=-1)
         # (B, T, H, hd) -> (B, H, T, hd)
@@ -29,7 +29,9 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        out = causal_sdpa(q, k, v)  # (B, H, T, hd)
+        if kv is not None:
+            k, v = kv.update(k, v)
+        out = attend(q, k, v)  # (B, H, T, hd)
         out = out.transpose(1, 2).reshape(B, T, C)
         return self.proj(out)
 
@@ -42,8 +44,8 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm(cfg.d_model)
         self.mlp = SwiGLU(cfg.d_model, cfg.d_ff)
 
-    def forward(self, x, cos, sin):
-        x = x + self.attn(self.attn_norm(x), cos, sin)
+    def forward(self, x, cos, sin, kv: KVCache | None = None):
+        x = x + self.attn(self.attn_norm(x), cos, sin, kv)
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -67,20 +69,23 @@ class BaselineTransformer(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
-    def _rope(self, T, device, dtype):
-        if self._rope_cache is None or self._rope_cache[0].shape[0] < T or self._rope_cache[0].device != device:
+    def _rope(self, start_pos, T, device, dtype):
+        if self._rope_cache is None or self._rope_cache[0].device != device:
             cos, sin = build_rope_cache(
                 self.cfg.max_seq_len, self.cfg.head_dim, self.cfg.rope_theta, device, dtype
             )
             self._rope_cache = (cos, sin)
         cos, sin = self._rope_cache
-        return cos[:T], sin[:T]
+        return cos[start_pos : start_pos + T], sin[start_pos : start_pos + T]
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def init_kv_cache(self) -> list[KVCache]:
+        return [KVCache() for _ in self.blocks]
+
+    def forward(self, idx: torch.Tensor, caches: list[KVCache] | None = None, start_pos: int = 0) -> torch.Tensor:
         B, T = idx.shape
         x = self.embed(idx)
-        cos, sin = self._rope(T, idx.device, x.dtype)
-        for block in self.blocks:
-            x = block(x, cos, sin)
+        cos, sin = self._rope(start_pos, T, idx.device, x.dtype)
+        for i, block in enumerate(self.blocks):
+            x = block(x, cos, sin, caches[i] if caches is not None else None)
         x = self.final_norm(x)
         return self.lm_head(x)

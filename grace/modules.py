@@ -78,6 +78,30 @@ class SwiGLU(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
-def causal_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Causal scaled-dot-product attention. Inputs (B, H, T, hd) -> (B, H, T, hd)."""
-    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+class KVCache:
+    """Per-attention-layer key/value cache for incremental decoding.
+
+    ``update`` appends the current step's keys/values (B, H, T, hd) and returns
+    the full cached (k, v) so the query can attend over all past positions.
+    """
+
+    def __init__(self):
+        self.k: torch.Tensor | None = None
+        self.v: torch.Tensor | None = None
+
+    def update(self, k: torch.Tensor, v: torch.Tensor):
+        self.k = k if self.k is None else torch.cat([self.k, k], dim=2)
+        self.v = v if self.v is None else torch.cat([self.v, v], dim=2)
+        return self.k, self.v
+
+
+def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Scaled-dot-product attention over (B, H, Tq, hd) queries and (B, H, Tk, hd)
+    keys/values. Handles both a full causal pass (Tq == Tk) and single-step
+    decoding against a longer cache (Tq == 1, attend all past)."""
+    tq, tk = q.shape[2], k.shape[2]
+    if tq == tk:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    if tq == 1:  # decode step: the one new query attends every cached key
+        return F.scaled_dot_product_attention(q, k, v, is_causal=False)
+    raise NotImplementedError("partial-chunk prefill into a non-empty cache is unsupported")

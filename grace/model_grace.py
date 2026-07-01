@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import GraceConfig
-from .modules import RMSNorm, apply_rope, build_rope_cache, causal_sdpa, rms_normalize
+from .modules import KVCache, RMSNorm, apply_rope, attend, build_rope_cache, rms_normalize
 
 
 def depth_attention(query: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
@@ -66,13 +66,13 @@ class GroupedAttnLayer(nn.Module):
         for w in (self.Wq, self.Wk, self.Wv, self.Wo):
             nn.init.normal_(w, mean=0.0, std=0.02)
 
-    def forward(self, pool, cos, sin):
+    def forward(self, pool, cos, sin, kv: KVCache | None = None):
         B, T = pool.shape[0], pool.shape[1]
         x = self.in_norm(depth_attention(self.query, pool))  # (B, T, G, d)
         q = torch.einsum("btgd,gde->btge", x, self.Wq)
         k = torch.einsum("btgd,gde->btge", x, self.Wk)
         v = torch.einsum("btgd,gde->btge", x, self.Wv)
-        # (B, T, G, d) -> (B, G*H, T, hd) for batched causal attention.
+        # (B, T, G, d) -> (B, G*H, T, hd) for batched attention (group as outer head).
         def heads(t):
             return t.view(B, T, self.G, self.H, self.hd).permute(0, 2, 3, 1, 4).reshape(
                 B, self.G * self.H, T, self.hd
@@ -80,7 +80,9 @@ class GroupedAttnLayer(nn.Module):
         q, k, v = heads(q), heads(k), heads(v)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        out = causal_sdpa(q, k, v)  # (B, G*H, T, hd)
+        if kv is not None:
+            k, v = kv.update(k, v)
+        out = attend(q, k, v)  # (B, G*H, T, hd)
         out = out.view(B, self.G, self.H, T, self.hd).permute(0, 3, 1, 2, 4).reshape(
             B, T, self.G, self.H * self.hd
         )
@@ -102,7 +104,7 @@ class GroupedMlpLayer(nn.Module):
         for w in (self.Wg, self.Wu, self.Wd):
             nn.init.normal_(w, mean=0.0, std=0.02)
 
-    def forward(self, pool, cos, sin):
+    def forward(self, pool, cos, sin, kv: KVCache | None = None):  # kv unused (no cross-token state)
         x = self.in_norm(depth_attention(self.query, pool))  # (B, T, G, d)
         gate = torch.einsum("btgd,gdf->btgf", x, self.Wg)
         up = torch.einsum("btgd,gdf->btgf", x, self.Wu)
@@ -130,22 +132,29 @@ class GraceTransformer(nn.Module):
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
         self._rope_cache: tuple | None = None
 
-    def _rope(self, T, device, dtype):
+    def _rope(self, start_pos, T, device, dtype):
         if self._rope_cache is None or self._rope_cache[0].device != device:
             cos, sin = build_rope_cache(
                 self.cfg.max_seq_len, self.cfg.head_dim, self.cfg.rope_theta, device, dtype
             )
             self._rope_cache = (cos, sin)
         cos, sin = self._rope_cache
-        return cos[:T], sin[:T]
+        return cos[start_pos : start_pos + T], sin[start_pos : start_pos + T]
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def init_kv_cache(self) -> list[KVCache | None]:
+        # Only attention layers hold a cache; mlp layers have no cross-token state.
+        return [KVCache() if isinstance(layer, GroupedAttnLayer) else None for layer in self.layers]
+
+    def forward(self, idx: torch.Tensor, caches: list | None = None, start_pos: int = 0) -> torch.Tensor:
         B, T = idx.shape
         x = self.embed(idx)  # (B, T, d)
-        cos, sin = self._rope(T, idx.device, x.dtype)
+        cos, sin = self._rope(start_pos, T, idx.device, x.dtype)
+        # The pool (depth-attention) is per-token, so each forward builds a fresh
+        # pool for just this chunk; cross-token state lives only in the attn KVCaches.
         pool = x.unsqueeze(2)  # (B, T, 1, d) — token embedding is the first pool entry
-        for layer in self.layers:
-            out = layer(pool, cos, sin)  # (B, T, G, d)
+        for i, layer in enumerate(self.layers):
+            kv = caches[i] if caches is not None else None
+            out = layer(pool, cos, sin, kv)  # (B, T, G, d)
             pool = torch.cat([pool, out], dim=2)  # append G entries
         final = depth_attention(self.readout_query, pool).squeeze(2)  # (B, T, d)
         final = self.final_norm(final)

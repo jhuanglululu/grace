@@ -76,6 +76,35 @@ else is training on. If every GPU is busy it aborts with a message rather than
 interfering. Override by setting `TrainConfig.device` (`"cuda:1"`, `"cpu"`) or
 the `CUDA_VISIBLE_DEVICES` env var, both of which are respected as-is.
 
+## Generate
+
+Sample from a checkpoint — the architecture is read from the run's
+`metadata.json` (must sit beside the `.pt`), so only the checkpoint path is
+needed:
+
+```bash
+uv run scripts/generate.py --ckpt-path ckpt/grace/0/epoch_3.pt \
+    --prompt "台灣" --rep-pen 1.2 --seed 0
+```
+
+Generation uses a **KV cache** (prefill the prompt, then O(1)-attention single-
+token steps). It runs an untimed **warmup** pass first (so kernel autotune /
+allocation don't skew the numbers), re-seeds, then reports **prefill and decode
+tok/s separately** — prefill is parallel prompt ingestion, decode is sequential
+single-token throughput:
+
+```
+[prefill: 16 tok in 26.1ms = 612.8 tok/s]
+[decode:  49 tok in 0.645s = 75.9 tok/s on cuda:0]
+```
+
+By default `--device` auto-picks a free GPU (same `nvidia-smi` logic as
+training); pass `--device cpu`/`cuda:1` to override.
+
+Flags: `--prompt` (empty starts from a document boundary), `--rep-pen`
+(repetition penalty, 1.0 = off), `--seed`, plus `--temperature`, `--top-k`,
+`--max-new-tokens`, `--device`.
+
 ## Test
 
 ```bash
