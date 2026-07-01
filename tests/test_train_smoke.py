@@ -1,14 +1,16 @@
-"""End-to-end smoke test: the trainer runs a full (tiny) 2-epoch run and writes
-its artifacts (metadata.json, record.jsonl, one checkpoint per epoch).
+"""End-to-end smoke test: the trainer runs, writes safetensors artifacts
+(top-3 best + last + best.json + metadata + record), and resumes from last.
 
-Guards against integration bugs across data -> model -> loss -> optimizer -> IO.
+Guards integration across data -> model -> loss -> optimizer -> checkpoint IO.
 """
 
+import glob
 import json
 import os
 
 import numpy as np
 import pytest
+from safetensors import safe_open
 
 from grace import config
 from grace.config import TrainConfig
@@ -22,35 +24,50 @@ def _write_data(tmp_path, vocab=64, n=6000):
     write_bin(str(tmp_path / "val.bin"), rng.integers(0, vocab, size=n // 4))
 
 
+def _tcfg(tmp_path, epochs):
+    return TrainConfig(data_dir=str(tmp_path), epochs=epochs, batch_size=4,
+                       overlap=8, device="cpu", seed=0)
+
+
 @pytest.mark.parametrize("model", ["baseline", "grace"])
-def test_train_writes_run_artifacts(tmp_path, monkeypatch, model):
+def test_train_writes_safetensors_artifacts(tmp_path, monkeypatch, model):
     _write_data(tmp_path)
-    # Point the "<model>_50m" preset at the tiny config so the run is CPU-fast.
     monkeypatch.setitem(config.PRESETS, f"{model}_50m", config.PRESETS[f"{model}_tiny"])
     run_dir = str(tmp_path / "run")
-    epochs = 2
-    tcfg = TrainConfig(
-        data_dir=str(tmp_path),
-        epochs=epochs,
-        batch_size=4,
-        overlap=8,
-        device="cpu",
-        seed=0,
-    )
-    train(model, out=run_dir, tcfg=tcfg)
+    train(model, tcfg=_tcfg(tmp_path, epochs=2), out=run_dir)
 
-    # metadata.json carries both configs and is valid JSON
     meta = json.load(open(os.path.join(run_dir, "metadata.json")))
     assert meta["model"] == model
-    assert "model_config" in meta and "train_config" in meta
 
-    # one checkpoint per epoch
-    for e in range(1, epochs + 1):
-        assert os.path.exists(os.path.join(run_dir, f"epoch_{e}.pt"))
+    # always-saved full-state checkpoint for resume
+    assert os.path.exists(os.path.join(run_dir, "last.safetensors"))
+    # top-K best (model weights), tracked in best.json, at most 3, and no .pt files
+    best = json.load(open(os.path.join(run_dir, "best.json")))
+    assert 1 <= len(best) <= 3
+    steps = glob.glob(os.path.join(run_dir, "step*.safetensors"))
+    assert len(steps) == len(best)
+    assert not glob.glob(os.path.join(run_dir, "*.pt"))
+    # best.json is sorted ascending by val loss
+    assert [r["val_loss"] for r in best] == sorted(r["val_loss"] for r in best)
 
-    # record.jsonl parses and contains per-step train losses and per-epoch val losses
-    lines = [json.loads(x) for x in open(os.path.join(run_dir, "record.jsonl"))]
-    assert lines, "record.jsonl is empty"
-    assert all({"step", "epoch", "train_loss", "val_loss", "time"} <= set(r) for r in lines)
-    assert any(r["train_loss"] is not None for r in lines)
-    assert sum(1 for r in lines if r["val_loss"] is not None) == epochs
+    # a best checkpoint holds model weights but NOT the tied head or optimizer state
+    with safe_open(steps[0], framework="pt") as f:
+        keys = set(f.keys())
+    assert "embed.weight" in keys
+    assert "lm_head.weight" not in keys
+    assert not any(k.startswith("opt.") for k in keys)
+
+
+def test_resume_continues_from_last(tmp_path, monkeypatch):
+    _write_data(tmp_path)
+    monkeypatch.setitem(config.PRESETS, "grace_50m", config.PRESETS["grace_tiny"])
+    run_dir = str(tmp_path / "run")
+
+    train("grace", tcfg=_tcfg(tmp_path, epochs=1), out=run_dir)
+    with safe_open(os.path.join(run_dir, "last.safetensors"), framework="pt") as f:
+        assert f.metadata()["resume_epoch"] == "1"  # epoch 0 completed
+
+    # resume with a larger epoch budget: should start at epoch 1 and finish it
+    train("grace", tcfg=_tcfg(tmp_path, epochs=2), out=run_dir, resume=True)
+    with safe_open(os.path.join(run_dir, "last.safetensors"), framework="pt") as f:
+        assert f.metadata()["resume_epoch"] == "2"

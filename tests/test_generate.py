@@ -27,12 +27,16 @@ def test_rep_pen_pushes_seen_tokens_down():
 
 
 def test_checkpoint_roundtrip(tmp_path):
+    from safetensors.torch import save_file
+
     cfg = PRESETS["grace_tiny"]
     model = GraceTransformer(cfg).eval()
-    torch.save({"model": model.state_dict()}, tmp_path / "epoch_1.pt")
+    # save model weights as safetensors (drop tied lm_head, like the trainer does)
+    sd = {k: v for k, v in model.state_dict().items() if k != "lm_head.weight"}
+    save_file(sd, str(tmp_path / "step1.safetensors"))
     json.dump({"model": "grace", "model_config": asdict(cfg)}, open(tmp_path / "metadata.json", "w"))
 
-    loaded, lcfg = load_model(str(tmp_path / "epoch_1.pt"), "cpu")
+    loaded, lcfg = load_model(str(tmp_path / "step1.safetensors"), "cpu")
     idx = torch.randint(0, cfg.vocab_size, (1, 12))
     with torch.no_grad():
         assert torch.allclose(model(idx), loaded(idx), atol=1e-6)  # same weights -> same logits

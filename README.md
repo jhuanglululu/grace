@@ -57,14 +57,23 @@ uv run python -m grace.train --model baseline           # -> ckpt/baseline/0/
 uv run python -m grace.train --model grace  --seed 1     # -> ckpt/grace/1/
 ```
 
-Each run writes to `ckpt/<model>/<seed>/` (override the dir with `--out`; warns
-up front if it already contains files):
+Each run writes to `ckpt/<model>/<seed>/` (override the dir with `--out`):
 
 | file | contents |
 |------|----------|
 | `metadata.json` | model + train config and param count |
 | `record.jsonl` | one line per step: `step`, `epoch`, `train_loss`, `val_loss`, `time` |
-| `epoch_{n}.pt` | checkpoint after each epoch (3 by default) |
+| `step{N}.safetensors` | the **top-3 checkpoints by validation loss** (model weights) |
+| `best.json` | the ranked top-3 (`step`, `val_loss`, `file`) |
+| `last.safetensors` | always-latest **full state** (model + optimizer + RNG) for resume |
+
+Checkpoints are safetensors (the tied LM head is dropped and re-tied on load).
+Resume an interrupted run with `--resume` (loads `last.safetensors`, continues at
+epoch granularity):
+
+```bash
+uv run python -m grace.train --model grace --resume
+```
 
 Progress is a tqdm bar (train loss, lr, and latest val loss in the postfix).
 Validation runs every `val_every` steps (default 500) and at each epoch end,

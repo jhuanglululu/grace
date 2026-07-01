@@ -8,11 +8,14 @@ to train, the seed, and (optionally) where to write the run:
     python -m grace.train --model grace --seed 1      # -> ckpt/grace/1/
 
 Each run writes to ``ckpt/<model>/<seed>/`` (override the dir with --out):
-    metadata.json   train + model config and param count
-    record.jsonl    one line per logged step: step, epoch, train/val loss, time
-    epoch_{n}.pt    a checkpoint after every epoch (3 by default)
+    metadata.json       train + model config and param count
+    record.jsonl        one line per logged step: step, epoch, train/val loss, time
+    step{N}.safetensors the top-3 checkpoints by validation loss (model weights)
+    best.json           the ranked top-3 (step, val_loss, file)
+    last.safetensors    always-latest full state (model + optimizer + RNG) for resume
 
-Runs on the remote L40S in bf16; also runs on CPU (fp32) for the tiny configs.
+Resume an interrupted run with ``--resume`` (loads last.safetensors, continues at
+epoch granularity). Runs on the remote L40S in bf16; also runs on CPU (fp32).
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from dataclasses import asdict, replace
 
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 from tqdm import tqdm
 
 from .config import PRESETS, BaselineConfig, GraceConfig, TrainConfig
@@ -40,6 +44,58 @@ from .utils import count_params
 GRAD_CLIP = 1.0
 WARMUP_FRAC = 0.02  # warmup steps = 2% of total
 VAL_EVERY = 500  # run validation every N optimizer steps
+TOP_K_CKPTS = 3  # keep the best-K checkpoints by validation loss
+
+
+def _model_tensors(model) -> dict:
+    """Model weights for a safetensors checkpoint (drop the tied lm_head, which
+    duplicates embed.weight and would trip safetensors' shared-tensor check)."""
+    return {k: v.detach().cpu().contiguous()
+            for k, v in model.state_dict().items() if k != "lm_head.weight"}
+
+
+def _optim_tensors(opt) -> dict:
+    out = {}
+    for i, st in opt.state_dict()["state"].items():
+        for name, v in st.items():
+            t = v if torch.is_tensor(v) else torch.tensor(v)
+            out[f"opt.{i}.{name}"] = t.detach().cpu().contiguous()
+    return out
+
+
+def _rng_tensors(gen, device) -> dict:
+    out = {"rng.torch": torch.get_rng_state(), "rng.gen": gen.get_state()}
+    if device.startswith("cuda"):
+        out["rng.cuda"] = torch.cuda.get_rng_state()
+    return out
+
+
+def load_resume(run_dir: str, model, opt, gen, device: str) -> int:
+    """Restore model + optimizer + RNG from last.safetensors; return the epoch to
+    resume at. Raises FileNotFoundError if there's nothing to resume from."""
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    path = os.path.join(run_dir, "last.safetensors")
+    flat = load_file(path, device="cpu")
+    model.load_state_dict(
+        {k: v for k, v in flat.items() if not k.startswith(("opt.", "rng."))}, strict=False
+    )
+    model.to(device)
+    state: dict = {}
+    for k, v in flat.items():
+        if k.startswith("opt."):
+            _, i, name = k.split(".", 2)
+            state.setdefault(int(i), {})[name] = v.to(device) if name != "step" else v
+    sd = opt.state_dict()
+    sd["state"] = state
+    opt.load_state_dict(sd)
+    torch.set_rng_state(flat["rng.torch"])
+    gen.set_state(flat["rng.gen"])
+    if device.startswith("cuda") and "rng.cuda" in flat:
+        torch.cuda.set_rng_state(flat["rng.cuda"])
+    with safe_open(path, framework="pt") as f:
+        return int(f.metadata()["resume_epoch"])
 
 
 def resolve_run_dir(model_kind: str, seed: int, out: str | None = None) -> str:
@@ -175,7 +231,7 @@ def evaluate(model, val_ds: WindowedDataset, batch_size: int, device: str):
     return sum(losses) / max(1, len(losses))
 
 
-def train(model_kind: str, tcfg: TrainConfig, out: str | None = None):
+def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bool = False):
     device = resolve_device(tcfg)
     if device.startswith("cuda") and ":" in device:
         torch.cuda.set_device(device)  # pin the chosen GPU for all allocations
@@ -188,9 +244,10 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None):
     n_params = count_params(model)
 
     run_dir = resolve_run_dir(model_kind, tcfg.seed, out)
-    if os.path.isdir(run_dir) and any(os.scandir(run_dir)):  # warn early, before a long run
-        print(f"WARNING: run dir {run_dir} already contains files; they may be overwritten")
     os.makedirs(run_dir, exist_ok=True)
+    resuming = resume and os.path.exists(os.path.join(run_dir, "last.safetensors"))
+    if os.path.isdir(run_dir) and any(os.scandir(run_dir)) and not resuming:
+        print(f"WARNING: run dir {run_dir} already contains files; they may be overwritten")
     with open(os.path.join(run_dir, "metadata.json"), "w") as f:
         json.dump(
             {"model": model_kind, "params": n_params, "device": device,
@@ -212,14 +269,26 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None):
     use_amp = device.startswith("cuda")
     gen = torch.Generator().manual_seed(tcfg.seed)  # dataset-shuffle RNG (independent of global seed)
 
-    record_f = open(os.path.join(run_dir, "record.jsonl"), "w")
+    # best_ckpts: (val_loss, step, path) sorted ascending, len <= TOP_K_CKPTS.
+    best_ckpts: list = []
+    start_epoch = 0
+    if resuming:
+        start_epoch = load_resume(run_dir, model, opt, gen, device)
+        best_path = os.path.join(run_dir, "best.json")
+        if os.path.exists(best_path):
+            best_ckpts = [(r["val_loss"], r["step"], os.path.join(run_dir, r["file"]))
+                          for r in json.load(open(best_path))]
+        print(f"resumed from last.safetensors at epoch {start_epoch}")
+
+    # Append to the record on resume, truncate on a fresh run.
+    record_f = open(os.path.join(run_dir, "record.jsonl"), "a" if resuming else "w")
 
     def record(**kw):
         record_f.write(json.dumps(kw) + "\n")
 
     model.train()
     t0 = time.time()
-    step = 0
+    step = start_epoch * steps_per_epoch  # LR schedule position (epoch-granular resume)
     last_val: float | None = None
 
     def optimizer_step() -> float:
@@ -239,8 +308,43 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None):
             p["val"] = f"{last_val:.3f}"
         pbar.set_postfix(**p)
 
+    def save_last(resume_epoch: int):
+        """Always-overwritten checkpoint with full state for resume-from-last."""
+        tensors = {**_model_tensors(model), **_optim_tensors(opt), **_rng_tensors(gen, device)}
+        meta = {"step": str(step), "resume_epoch": str(resume_epoch), "model": model_kind}
+        if last_val is not None:
+            meta["val_loss"] = f"{last_val:.6f}"
+        save_file(tensors, os.path.join(run_dir, "last.safetensors"), metadata=meta)
+
+    def save_best(epoch: int):
+        """Keep the TOP_K_CKPTS lowest-val-loss checkpoints (model weights only)."""
+        if last_val is None:
+            return
+        if len(best_ckpts) >= TOP_K_CKPTS and last_val >= best_ckpts[-1][0]:
+            return  # not better than the worst kept
+        path = os.path.join(run_dir, f"step{step}.safetensors")
+        if any(p == path for _, _, p in best_ckpts):
+            return  # already saved this exact step
+        save_file(_model_tensors(model), path,
+                  metadata={"step": str(step), "epoch": str(epoch),
+                            "val_loss": f"{last_val:.6f}", "model": model_kind})
+        best_ckpts.append((last_val, step, path))
+        best_ckpts.sort(key=lambda r: r[0])
+        while len(best_ckpts) > TOP_K_CKPTS:
+            _, _, evict = best_ckpts.pop()
+            if os.path.exists(evict):
+                os.remove(evict)
+        with open(os.path.join(run_dir, "best.json"), "w") as f:
+            json.dump([{"rank": i + 1, "step": s, "val_loss": vl, "file": os.path.basename(p)}
+                       for i, (vl, s, p) in enumerate(best_ckpts)], f, indent=2)
+
+    def checkpoint(epoch: int, resume_epoch: int):
+        save_best(epoch)          # top-K by val loss (model only)
+        save_last(resume_epoch)   # always: latest full state for resume
+        record_f.flush()
+
     try:
-        for epoch in range(tcfg.epochs):
+        for epoch in range(start_epoch, tcfg.epochs):
             last_loss = float("nan")
             opt.zero_grad(set_to_none=True)
             pbar = tqdm(
@@ -262,21 +366,19 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None):
                 record(step=step, epoch=epoch, train_loss=last_loss,
                        val_loss=last_val if did_val else None, time=time.time() - t0)
                 if did_val:
-                    record_f.flush()  # bound log loss on a mid-epoch kill to one val interval
+                    checkpoint(epoch, resume_epoch=epoch)  # mid-epoch -> resume restarts this epoch
                 postfix(pbar, lr)
             pbar.close()
 
-            # End-of-epoch validation + checkpoint.
+            # End-of-epoch validation + checkpoint (resume anchor = next epoch).
             if val_ds is not None:
                 last_val = evaluate(model, val_ds, tcfg.batch_size, device)
             record(step=step, epoch=epoch, train_loss=last_loss, val_loss=last_val, time=time.time() - t0)
-            record_f.flush()
-            ckpt = os.path.join(run_dir, f"epoch_{epoch + 1}.pt")
-            torch.save({"model": model.state_dict(), "epoch": epoch + 1, "step": step}, ckpt)
+            checkpoint(epoch, resume_epoch=epoch + 1)
             msg = f"epoch {epoch + 1}/{tcfg.epochs} done | train {last_loss:.4f}"
             if last_val is not None:
                 msg += f" | val {last_val:.4f}"
-            tqdm.write(f"{msg} | saved {ckpt}")
+            tqdm.write(f"{msg} | saved last.safetensors + top-{TOP_K_CKPTS}")
     finally:
         record_f.close()
     print(f"done. run_dir={run_dir}")
@@ -295,8 +397,9 @@ def main():
     p.add_argument("--model", choices=["baseline", "grace"], required=True)
     p.add_argument("--out", default=None, help="run directory (default ckpt/<model>/<seed>/)")
     p.add_argument("--seed", type=int, default=0, help="RNG seed (for training multiple models)")
+    p.add_argument("--resume", action="store_true", help="resume from last.safetensors in the run dir")
     args = p.parse_args()
-    train(args.model, out=args.out, tcfg=replace(TrainConfig(), seed=args.seed))
+    train(args.model, out=args.out, tcfg=replace(TrainConfig(), seed=args.seed), resume=args.resume)
 
 
 if __name__ == "__main__":

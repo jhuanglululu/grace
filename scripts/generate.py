@@ -44,13 +44,18 @@ def config_from_metadata(meta: dict):
 
 
 def load_model(ckpt_path: str, device: str = "cpu"):
+    from safetensors.torch import load_file
+
     meta_path = os.path.join(os.path.dirname(ckpt_path), "metadata.json")
     with open(meta_path) as f:
         meta = json.load(f)
     kind, cfg = config_from_metadata(meta)
     model = BaselineTransformer(cfg) if kind == "baseline" else GraceTransformer(cfg)
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    flat = load_file(ckpt_path, device="cpu")
+    # strict=False: lm_head is tied (absent from the file), and last.safetensors
+    # carries extra optimizer/RNG tensors that are not model params.
+    model.load_state_dict({k: v for k, v in flat.items() if not k.startswith(("opt.", "rng."))},
+                          strict=False)
     model.to(device).eval()
     return model, cfg
 
