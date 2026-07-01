@@ -47,13 +47,13 @@ def test_pool_grows_by_G_per_layer():
     cfg = m.cfg
     idx = torch.randint(0, cfg.vocab_size, (2, 12))
     x = m.embed(idx)
-    pool = x.unsqueeze(2)
+    pool = rms_normalize(x).unsqueeze(2)  # entries are normalized at append time
     cos, sin = m._rope(0, 12, idx.device, x.dtype)
     sizes = [pool.shape[2]]
     for layer in m.layers:
         out = layer(pool, cos, sin)
         assert out.shape == (2, 12, cfg.groups, cfg.d_model)
-        pool = torch.cat([pool, out], dim=2)
+        pool = torch.cat([pool, rms_normalize(out)], dim=2)
         sizes.append(pool.shape[2])
     assert sizes == [1 + cfg.groups * i for i in range(cfg.n_layer + 1)]
     assert pool.shape[2] == cfg.max_pool
@@ -61,11 +61,11 @@ def test_pool_grows_by_G_per_layer():
 
 def test_zero_query_is_uniform_average_of_pool():
     # With a zero query, softmax over the pool is uniform, so the composed input
-    # is exactly the mean of the RMS-normalised pool entries (per token).
+    # is exactly the mean of the pool entries (which are pre-normalized at append).
     G, d = 4, 32
     pool = torch.randn(2, 5, 7, d)  # (B, T, P, d)
     composed = depth_attention(torch.zeros(G, d), pool)  # (B, T, G, d)
-    expected = rms_normalize(pool).mean(dim=2, keepdim=True).expand(-1, -1, G, -1)
+    expected = pool.mean(dim=2, keepdim=True).expand(-1, -1, G, -1)
     assert torch.allclose(composed, expected, atol=1e-5)
 
 

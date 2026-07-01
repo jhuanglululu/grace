@@ -33,18 +33,19 @@ def depth_attention(query: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
     """Grouped attention over the pool along the *depth* axis (not the seq axis).
 
     query: (G, d) learned per-group depth queries.
-    pool:  (B, T, P, d) all prior block outputs (raw; normalized here as K/V).
+    pool:  (B, T, P, d) all prior block outputs, ALREADY RMS-normalized (each
+           entry is normalized once when appended — see GraceTransformer.forward),
+           so it serves directly as keys and values. K and V share the pool.
     returns composed inputs (B, T, G, d).
 
     With a zero query the softmax is uniform, so the composed input is the mean
-    of the RMS-normalized pool entries.
+    of the pool entries.
     """
     d = query.shape[-1]
-    kv = rms_normalize(pool)  # (B, T, P, d) — K and V share the normalized pool
     scale = 1.0 / math.sqrt(d)
-    scores = torch.einsum("gd,btpd->btgp", query, kv) * scale  # (B, T, G, P)
+    scores = torch.einsum("gd,btpd->btgp", query, pool) * scale  # (B, T, G, P)
     attn = torch.softmax(scores, dim=-1)
-    composed = torch.einsum("btgp,btpd->btgd", attn, kv)  # (B, T, G, d)
+    composed = torch.einsum("btgp,btpd->btgd", attn, pool)  # (B, T, G, d)
     return composed
 
 
@@ -148,11 +149,14 @@ class GraceTransformer(nn.Module):
         cos, sin = self._rope(start_pos, T, idx.device, x.dtype)
         # The pool (depth-attention) is per-token, so each forward builds a fresh
         # pool for just this chunk; cross-token state lives only in the attn KVCaches.
-        pool = x.unsqueeze(2)  # (B, T, 1, d) — token embedding is the first pool entry
+        # Entries are RMS-normalized once as they are appended (equivalent to
+        # normalizing at use, since RMS-norm is per-entry) — this stores the pool
+        # once instead of raw+normalized, roughly halving pool activation memory.
+        pool = rms_normalize(x).unsqueeze(2)  # (B, T, 1, d) — normalized embedding is entry 0
         for i, layer in enumerate(self.layers):
             kv = caches[i] if caches is not None else None
             out = layer(pool, cos, sin, kv)  # (B, T, G, d)
-            pool = torch.cat([pool, out], dim=2)  # append G entries
+            pool = torch.cat([pool, rms_normalize(out)], dim=2)  # append G normalized entries
         final = depth_attention(self.readout_query, pool).squeeze(2)  # (B, T, d)
         final = self.final_norm(final)
         return self.lm_head(final)
