@@ -79,6 +79,17 @@ def test_distinct_queries_give_distinct_inputs():
     assert not torch.allclose(composed[:, :, 0], composed[:, :, 1])
 
 
+def test_buffered_infer_matches_cat_path():
+    # The no-grad preallocated-buffer path must equal the autograd cat path.
+    m = GraceTransformer(PRESETS["grace_tiny"]).eval()
+    idx = torch.randint(0, m.cfg.vocab_size, (2, 16))
+    with torch.enable_grad():
+        cat_logits = m(idx)  # grad enabled -> _forward_cat
+    with torch.no_grad():
+        buf_logits = m(idx)  # grad disabled -> _forward_buffered
+    assert torch.allclose(cat_logits.detach(), buf_logits, atol=1e-5)
+
+
 def test_causality_future_tokens_do_not_leak():
     m = _model().eval()
     T, j = 16, 8

@@ -155,6 +155,8 @@ def main():
     p.add_argument("--temperature", type=float, default=0.8, help="0 => greedy")
     p.add_argument("--top-k", type=int, default=50, help="0 => no top-k")
     p.add_argument("--device", default=None, help="default: auto-pick a free GPU (see train.resolve_device)")
+    p.add_argument("--compile", choices=["auto", "on", "off"], default="auto",
+                   help="torch.compile the model to fuse kernels (auto = on for CUDA)")
     args = p.parse_args()
 
     device = resolve_device(TrainConfig(device=args.device))
@@ -167,6 +169,19 @@ def main():
     tok = GraceTokenizer()
     model, cfg = load_model(args.ckpt_path, device)
 
+    # Fuse the many small ops (norms, softmax, rope, depth-attention) into few
+    # kernels. This is where GRACE's fewer-layers advantage shows up: eager launch
+    # overhead otherwise dominates at batch-1. Applied to both models so the
+    # comparison is architecture, not compile-vs-eager. The warmup below absorbs
+    # the one-time compile cost.
+    do_compile = args.compile == "on" or (args.compile == "auto" and device.startswith("cuda"))
+    if do_compile:
+        # dynamic=True: compile once for a dynamic sequence/position rather than
+        # relying on automatic-dynamic to engage as start_pos and the KV-cache
+        # length grow each decode step (else the timed run could recompile).
+        model = torch.compile(model, dynamic=True)
+        print("torch.compile enabled (dynamic=True)")
+
     prompt_ids = tok.encode(args.prompt)
     if not prompt_ids:  # seed from a document boundary the model saw in training
         prompt_ids = [tok.eos_id if tok.eos_id is not None else (tok.bos_id or 0)]
@@ -176,9 +191,15 @@ def main():
         eos_id=tok.eos_id, max_seq_len=cfg.max_seq_len, device=device,
     )
 
-    # Warm up (kernel autotune / allocation) so the timed run measures steady state,
-    # not first-call overhead. This is a benchmark, not a chatbot — accuracy first.
-    generate_ids(model, prompt_ids, max_new_tokens=WARMUP_TOKENS, **common)
+    # Warm up (compile + kernel autotune / allocation) so the timed run measures
+    # steady state. Force greedy with no EOS stop so warmup ALWAYS runs the full
+    # decode path (not cut short by an early EOS), guaranteeing the decode shape
+    # is compiled before timing. This is a benchmark, not a chatbot — accuracy first.
+    generate_ids(
+        model, prompt_ids, max_new_tokens=WARMUP_TOKENS,
+        temperature=0.0, top_k=0, rep_pen=1.0, eos_id=None,
+        max_seq_len=cfg.max_seq_len, device=device,
+    )
 
     # Re-seed after warmup so --seed still determines the actual output.
     torch.manual_seed(args.seed)

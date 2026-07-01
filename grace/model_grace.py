@@ -144,19 +144,41 @@ class GraceTransformer(nn.Module):
         return [KVCache() if isinstance(layer, GroupedAttnLayer) else None for layer in self.layers]
 
     def forward(self, idx: torch.Tensor, caches: list | None = None, start_pos: int = 0) -> torch.Tensor:
+        # Training needs autograd, which doesn't mix with in-place buffer writes,
+        # so it uses the cat path. Inference (no-grad) uses a preallocated pool
+        # buffer with slice writes — no per-layer allocation/copy, and the pool
+        # indexing is compile-time constant (B/T stay dynamic) — see claude.md.
+        if torch.is_grad_enabled():
+            return self._forward_cat(idx, caches, start_pos)
+        return self._forward_buffered(idx, caches, start_pos)
+
+    def _forward_cat(self, idx, caches, start_pos):
         B, T = idx.shape
         x = self.embed(idx)  # (B, T, d)
         cos, sin = self._rope(start_pos, T, idx.device, x.dtype)
-        # The pool (depth-attention) is per-token, so each forward builds a fresh
-        # pool for just this chunk; cross-token state lives only in the attn KVCaches.
-        # Entries are RMS-normalized once as they are appended (equivalent to
-        # normalizing at use, since RMS-norm is per-entry) — this stores the pool
-        # once instead of raw+normalized, roughly halving pool activation memory.
+        # Pool entries are RMS-normalized once as they are appended (equivalent to
+        # normalizing at use, since RMS-norm is per-entry): stores the pool once
+        # instead of raw+normalized, ~halving pool activation memory.
         pool = rms_normalize(x).unsqueeze(2)  # (B, T, 1, d) — normalized embedding is entry 0
         for i, layer in enumerate(self.layers):
             kv = caches[i] if caches is not None else None
             out = layer(pool, cos, sin, kv)  # (B, T, G, d)
             pool = torch.cat([pool, rms_normalize(out)], dim=2)  # append G normalized entries
         final = depth_attention(self.readout_query, pool).squeeze(2)  # (B, T, d)
-        final = self.final_norm(final)
-        return self.lm_head(final)
+        return self.lm_head(self.final_norm(final))
+
+    def _forward_buffered(self, idx, caches, start_pos):
+        B, T = idx.shape
+        x = self.embed(idx)  # (B, T, d)
+        cos, sin = self._rope(start_pos, T, idx.device, x.dtype)
+        G, P = self.cfg.groups, self.cfg.max_pool
+        pool_buf = x.new_empty(B, T, P, self.cfg.d_model)  # one allocation
+        pool_buf[:, :, 0, :] = rms_normalize(x)  # entry 0 = normalized embedding
+        n = 1  # valid pool entries so far (compile-time constant per unrolled layer)
+        for i, layer in enumerate(self.layers):
+            kv = caches[i] if caches is not None else None
+            out = layer(pool_buf[:, :, :n, :], cos, sin, kv)  # (B, T, G, d)
+            pool_buf[:, :, n : n + G, :] = rms_normalize(out)  # in-place append
+            n += G
+        final = depth_attention(self.readout_query, pool_buf[:, :, :n, :]).squeeze(2)
+        return self.lm_head(self.final_norm(final))
