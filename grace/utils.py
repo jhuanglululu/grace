@@ -10,7 +10,7 @@ from .config import BaselineConfig, GraceConfig
 def count_params(model: nn.Module, non_embedding: bool = False) -> int:
     total = sum(p.numel() for p in model.parameters())
     if non_embedding:
-        # Subtract the token-embedding table (tied head shares it, so count once).
+        # The LM head is always tied to this table, so it's counted once here.
         emb = getattr(model, "embed", None)
         if emb is not None:
             total -= emb.weight.numel()

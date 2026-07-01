@@ -35,6 +35,12 @@ from .model_baseline import BaselineTransformer
 from .model_grace import GraceTransformer
 from .utils import count_params
 
+# Fixed training mechanics — never swept, so constants rather than TrainConfig
+# fields (kept out of metadata.json).
+GRAD_CLIP = 1.0
+WARMUP_FRAC = 0.02  # warmup steps = 2% of total
+VAL_EVERY = 500  # run validation every N optimizer steps
+
 
 def resolve_run_dir(model_kind: str, seed: int, out: str | None = None) -> str:
     """Directory holding a run's artifacts. An explicit ``out`` wins, otherwise
@@ -58,6 +64,26 @@ def build_model(kind: str):
 
 def loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
+
+def build_optimizer(model, tcfg: TrainConfig):
+    """AdamW with weight decay only on >=2-D matmul weights. RMSNorm scales
+    (1-D) and the zero-init depth queries are excluded: decaying the queries
+    toward zero would fight the very differentiation that keeps GRACE's parallel
+    groups from collapsing (see claude.md)."""
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or name.endswith("query") or name.endswith("readout_query"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    groups = [
+        {"params": decay, "weight_decay": tcfg.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=tcfg.lr, betas=(0.9, 0.95))
 
 
 def cosine_lr(step: int, total: int, base: float, warmup: int, min_ratio: float = 0.1) -> float:
@@ -149,11 +175,14 @@ def evaluate(model, val_ds: WindowedDataset, batch_size: int, device: str):
     return sum(losses) / max(1, len(losses))
 
 
-def train(model_kind: str, out: str | None = None, tcfg: TrainConfig | None = None):
-    tcfg = tcfg or TrainConfig()
+def train(model_kind: str, tcfg: TrainConfig, out: str | None = None):
     device = resolve_device(tcfg)
     if device.startswith("cuda") and ":" in device:
         torch.cuda.set_device(device)  # pin the chosen GPU for all allocations
+    # Seed BEFORE build_model so weight init (nn.init.normal_) is reproducible per seed.
+    torch.manual_seed(tcfg.seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(tcfg.seed)
     model, cfg = build_model(model_kind)
     model.to(device)
     n_params = count_params(model)
@@ -175,15 +204,13 @@ def train(model_kind: str, out: str | None = None, tcfg: TrainConfig | None = No
     val_ds = WindowedDataset(val_path, cfg.max_seq_len, tcfg.overlap) if os.path.exists(val_path) else None
 
     n_windows = len(train_ds)
-    batches_per_epoch = math.ceil(n_windows / tcfg.batch_size)
-    steps_per_epoch = math.ceil(batches_per_epoch / tcfg.grad_accum)
+    steps_per_epoch = math.ceil(n_windows / tcfg.batch_size)  # one optimizer step per batch
     total_steps = max(1, steps_per_epoch * tcfg.epochs)
-    warmup = tcfg.warmup or max(1, int(0.02 * total_steps))
+    warmup = max(1, int(WARMUP_FRAC * total_steps))
 
-    opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr, betas=(0.9, 0.95), weight_decay=tcfg.weight_decay)
+    opt = build_optimizer(model, tcfg)
     use_amp = device.startswith("cuda")
-    gen = torch.Generator().manual_seed(tcfg.seed)
-    torch.manual_seed(tcfg.seed)
+    gen = torch.Generator().manual_seed(tcfg.seed)  # dataset-shuffle RNG (independent of global seed)
 
     record_f = open(os.path.join(run_dir, "record.jsonl"), "w")
 
@@ -200,7 +227,7 @@ def train(model_kind: str, out: str | None = None, tcfg: TrainConfig | None = No
         lr = cosine_lr(step, total_steps, tcfg.lr, warmup)
         for g in opt.param_groups:
             g["lr"] = lr
-        torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
@@ -214,32 +241,29 @@ def train(model_kind: str, out: str | None = None, tcfg: TrainConfig | None = No
 
     try:
         for epoch in range(tcfg.epochs):
-            micro = 0
             last_loss = float("nan")
             opt.zero_grad(set_to_none=True)
             pbar = tqdm(
                 train_ds.iter_epoch(tcfg.batch_size, shuffle=True, generator=gen),
-                total=batches_per_epoch,
+                total=steps_per_epoch,
                 desc=f"epoch {epoch + 1}/{tcfg.epochs}",
             )
             for x, y in pbar:
                 x, y = x.to(device), y.to(device)
                 ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else _nullctx()
                 with ctx:
-                    loss = loss_fn(model(x), y) / tcfg.grad_accum
+                    loss = loss_fn(model(x), y)
                 loss.backward()
-                last_loss = loss.item() * tcfg.grad_accum
-                micro += 1
-                if micro % tcfg.grad_accum == 0:
-                    lr = optimizer_step()
-                    did_val = val_ds is not None and step % tcfg.val_every == 0
-                    if did_val:
-                        last_val = evaluate(model, val_ds, tcfg.batch_size, device)
-                    record(step=step, epoch=epoch, train_loss=last_loss,
-                           val_loss=last_val if did_val else None, time=time.time() - t0)
-                    postfix(pbar, lr)
-            if micro % tcfg.grad_accum != 0:  # flush trailing partial accumulation
-                optimizer_step()
+                last_loss = loss.item()
+                lr = optimizer_step()
+                did_val = val_ds is not None and step % VAL_EVERY == 0
+                if did_val:
+                    last_val = evaluate(model, val_ds, tcfg.batch_size, device)
+                record(step=step, epoch=epoch, train_loss=last_loss,
+                       val_loss=last_val if did_val else None, time=time.time() - t0)
+                if did_val:
+                    record_f.flush()  # bound log loss on a mid-epoch kill to one val interval
+                postfix(pbar, lr)
             pbar.close()
 
             # End-of-epoch validation + checkpoint.

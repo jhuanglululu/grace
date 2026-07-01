@@ -12,6 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Fixed architecture mechanic — identical for both models and never swept, so a
+# constant (not a config field) and kept out of metadata.json. Embeddings are
+# always tied to the LM head: it's baked into the model code (a necessity at this
+# size), not a toggle.
+ROPE_THETA = 10000.0
+
 
 @dataclass
 class BaselineConfig:
@@ -23,9 +29,6 @@ class BaselineConfig:
     n_head: int = 8
     d_ff: int = 1472  # SwiGLU inner width
     max_seq_len: int = 1024
-    rope_theta: float = 10000.0
-    tie_embeddings: bool = True
-    dropout: float = 0.0
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_head == 0, "d_model must be divisible by n_head"
@@ -65,8 +68,6 @@ class GraceConfig:
         ]
     )
     max_seq_len: int = 1024
-    rope_theta: float = 10000.0
-    tie_embeddings: bool = True
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_head == 0, "d_model must be divisible by n_head"
@@ -90,26 +91,24 @@ class GraceConfig:
 
 @dataclass
 class TrainConfig:
-    """Training hyperparameters shared by BOTH models.
+    """Experiment knobs shared by BOTH models (dumped verbatim to metadata.json).
 
     These are deliberately not CLI flags: the baseline vs. GRACE comparison is
     only fair if every training knob is identical, so they live here as one
-    source of truth. Only the model choice (baseline/grace) and the checkpoint
-    path vary between the two runs.
+    source of truth. Only the model choice (baseline/grace), the seed, and the
+    checkpoint path vary between runs. Fixed training mechanics that are never
+    swept (grad clip, warmup fraction, validation cadence) are constants in
+    ``train.py`` rather than fields here.
     """
 
     data_dir: str = "data"
     epochs: int = 1
     batch_size: int = 32
     overlap: int = 256  # sliding-window overlap (window size = model max_seq_len)
-    grad_accum: int = 1
     lr: float = 3e-4
     weight_decay: float = 0.1
-    grad_clip: float = 1.0
-    warmup: int = 0  # 0 => auto (2% of total steps)
-    val_every: int = 500  # run validation every N optimizer steps
     device: Optional[str] = None  # None => cuda if available else cpu
-    seed: int = 1337
+    seed: int = 0
 
 
 PRESETS: dict[str, object] = {

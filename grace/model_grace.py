@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import GraceConfig
+from .config import ROPE_THETA, GraceConfig
 from .modules import KVCache, RMSNorm, apply_rope, attend, build_rope_cache, rms_normalize
 
 
@@ -125,17 +125,14 @@ class GraceTransformer(nn.Module):
         self.readout_query = nn.Parameter(torch.zeros(1, cfg.d_model))
         self.final_norm = RMSNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        if cfg.tie_embeddings:
-            self.lm_head.weight = self.embed.weight
+        self.lm_head.weight = self.embed.weight  # weights always tied
         nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
-        if not cfg.tie_embeddings:
-            nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
         self._rope_cache: tuple | None = None
 
     def _rope(self, start_pos, T, device, dtype):
-        if self._rope_cache is None or self._rope_cache[0].device != device:
+        if self._rope_cache is None or self._rope_cache[0].device != device or self._rope_cache[0].dtype != dtype:
             cos, sin = build_rope_cache(
-                self.cfg.max_seq_len, self.cfg.head_dim, self.cfg.rope_theta, device, dtype
+                self.cfg.max_seq_len, self.cfg.head_dim, ROPE_THETA, device, dtype
             )
             self._rope_cache = (cos, sin)
         cos, sin = self._rope_cache

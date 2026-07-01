@@ -42,7 +42,7 @@ def build_rope_cache(seq_len: int, head_dim: int, theta: float, device, dtype):
     inv_freq = 1.0 / (theta ** (torch.arange(0, half, device=device).float() / half))
     pos = torch.arange(seq_len, device=device).float()
     freqs = torch.outer(pos, inv_freq)  # (seq_len, half)
-    # duplicate each frequency for the interleaved-half layout below
+    # repeat the half-width freqs to match the split-half rotate_half convention
     emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, head_dim)
     return emb.cos().to(dtype), emb.sin().to(dtype)
 

@@ -34,7 +34,6 @@ def test_train_writes_run_artifacts(tmp_path, monkeypatch, model):
         epochs=epochs,
         batch_size=4,
         overlap=8,
-        grad_accum=2,
         device="cpu",
         seed=0,
     )
