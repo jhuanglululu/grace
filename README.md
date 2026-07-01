@@ -43,7 +43,7 @@ per split; training examples are **sliding windows** of size `max_seq_len`
 docs), not a fraction:
 
 ```bash
-uv run python -m scripts.prepare_data --out-dir data --val-tokens 1000000
+uv run scripts/prepare_data.py --out-dir data --val-tokens 1000000
 ```
 
 ## Train

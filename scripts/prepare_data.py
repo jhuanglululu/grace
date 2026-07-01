@@ -1,17 +1,23 @@
 """Download erhwenkuo/wikipedia-zhtw, tokenize with the provided 8k tokenizer,
 and write packed uint16 train/val bins.
 
-Usage:
-    python -m scripts.prepare_data --out-dir data --val-frac 0.005
+Usage (either form works):
+    uv run scripts/prepare_data.py --out-dir data --val-tokens 1000000
+    uv run python -m scripts.prepare_data --out-dir data --val-tokens 1000000
 
-Documents are concatenated with <eos> separators. A held-out fraction of
-documents forms the validation split.
+Documents are concatenated with <eos> separators; validation holds out a fixed
+number of tokens (whole docs).
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import sys
+
+# Allow running this file directly (`uv run scripts/prepare_data.py`) even when
+# the `grace` package isn't installed: put the repo root on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from tqdm import tqdm
