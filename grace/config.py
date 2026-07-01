@@ -102,7 +102,7 @@ class TrainConfig:
     """
 
     data_dir: str = "data"
-    epochs: int = 1
+    epochs: int = 3
     batch_size: int = 32
     overlap: int = 256  # sliding-window overlap (window size = model max_seq_len)
     lr: float = 3e-4
