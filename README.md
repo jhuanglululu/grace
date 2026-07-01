@@ -89,11 +89,11 @@ the `CUDA_VISIBLE_DEVICES` env var, both of which are respected as-is.
 ## Generate
 
 Sample from a checkpoint — the architecture is read from the run's
-`metadata.json` (must sit beside the `.pt`), so only the checkpoint path is
-needed:
+`metadata.json` (must sit beside the checkpoint), so only the checkpoint path is
+needed. Point it at a `best.json`-listed checkpoint or `last.safetensors`:
 
 ```bash
-uv run scripts/generate.py --ckpt-path ckpt/grace/0/epoch_3.pt \
+uv run scripts/generate.py --ckpt-path ckpt/grace/0/last.safetensors \
     --prompt "台灣" --rep-pen 1.2 --seed 0
 ```
 

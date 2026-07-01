@@ -1,11 +1,11 @@
 """Load a trained checkpoint and generate text from a prompt.
 
 The model architecture/config is read from ``metadata.json`` in the checkpoint's
-run directory (written by the trainer), so only the ``.pt`` path is needed.
+run directory (written by the trainer), so only the checkpoint path is needed.
 
 Usage (either form works):
-    uv run scripts/generate.py --ckpt-path ckpt/grace/0/epoch_3.pt --prompt "台灣" --rep-pen 1.2
-    uv run python -m scripts.generate --ckpt-path ckpt/grace/0/epoch_3.pt
+    uv run scripts/generate.py --ckpt-path ckpt/grace/0/last.safetensors --prompt "台灣" --rep-pen 1.2
+    uv run python -m scripts.generate --ckpt-path ckpt/grace/0/last.safetensors
 """
 
 from __future__ import annotations
@@ -152,7 +152,7 @@ def generate_ids(
 
 def main():
     p = argparse.ArgumentParser(description="Generate text from a trained checkpoint.")
-    p.add_argument("--ckpt-path", required=True, help="path to a .pt checkpoint (metadata.json must sit beside it)")
+    p.add_argument("--ckpt-path", required=True, help="path to a .safetensors checkpoint (metadata.json must sit beside it)")
     p.add_argument("--prompt", default="", help="conditioning text (empty => start from a doc boundary)")
     p.add_argument("--rep-pen", type=float, default=1.1, help="repetition penalty (1.0 = off)")
     p.add_argument("--seed", type=int, default=0)
