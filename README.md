@@ -66,9 +66,10 @@ up front if it already contains files):
 | `record.jsonl` | one line per step: `step`, `epoch`, `train_loss`, `val_loss`, `time` |
 | `epoch_{n}.pt` | checkpoint after each epoch (3 by default) |
 
-Progress is a tqdm bar (loss/lr in the postfix). Validation loss is estimated
-over a fixed 10 batches each epoch. Defaults: 3 epochs, bf16 on CUDA. Compare
-validation loss (`record.jsonl`) and tokens/sec.
+Progress is a tqdm bar (train loss, lr, and latest val loss in the postfix).
+Validation runs every `val_every` steps (default 500) and at each epoch end,
+estimated over a fixed 10 batches, and is logged to `record.jsonl`. Defaults:
+3 epochs, bf16 on CUDA. Compare validation loss and tokens/sec.
 
 **GPU selection (shared servers):** by default the trainer queries `nvidia-smi`
 and picks the freest idle GPU (< ~1 GB used), so it won't land on a card someone

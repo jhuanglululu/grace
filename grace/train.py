@@ -193,6 +193,7 @@ def train(model_kind: str, out: str | None = None, tcfg: TrainConfig | None = No
     model.train()
     t0 = time.time()
     step = 0
+    last_val: float | None = None
 
     def optimizer_step() -> float:
         nonlocal step
@@ -204,6 +205,12 @@ def train(model_kind: str, out: str | None = None, tcfg: TrainConfig | None = No
         opt.zero_grad(set_to_none=True)
         step += 1
         return lr
+
+    def postfix(pbar, lr):
+        p = {"loss": f"{last_loss:.3f}", "lr": f"{lr:.1e}"}
+        if last_val is not None:
+            p["val"] = f"{last_val:.3f}"
+        pbar.set_postfix(**p)
 
     try:
         for epoch in range(tcfg.epochs):
@@ -225,20 +232,26 @@ def train(model_kind: str, out: str | None = None, tcfg: TrainConfig | None = No
                 micro += 1
                 if micro % tcfg.grad_accum == 0:
                     lr = optimizer_step()
-                    record(step=step, epoch=epoch, train_loss=last_loss, val_loss=None, time=time.time() - t0)
-                    pbar.set_postfix(loss=f"{last_loss:.3f}", lr=f"{lr:.1e}")
+                    did_val = val_ds is not None and step % tcfg.val_every == 0
+                    if did_val:
+                        last_val = evaluate(model, val_ds, tcfg.batch_size, device)
+                    record(step=step, epoch=epoch, train_loss=last_loss,
+                           val_loss=last_val if did_val else None, time=time.time() - t0)
+                    postfix(pbar, lr)
             if micro % tcfg.grad_accum != 0:  # flush trailing partial accumulation
                 optimizer_step()
             pbar.close()
 
-            val_loss = evaluate(model, val_ds, tcfg.batch_size, device) if val_ds is not None else None
-            record(step=step, epoch=epoch, train_loss=last_loss, val_loss=val_loss, time=time.time() - t0)
+            # End-of-epoch validation + checkpoint.
+            if val_ds is not None:
+                last_val = evaluate(model, val_ds, tcfg.batch_size, device)
+            record(step=step, epoch=epoch, train_loss=last_loss, val_loss=last_val, time=time.time() - t0)
             record_f.flush()
             ckpt = os.path.join(run_dir, f"epoch_{epoch + 1}.pt")
             torch.save({"model": model.state_dict(), "epoch": epoch + 1, "step": step}, ckpt)
             msg = f"epoch {epoch + 1}/{tcfg.epochs} done | train {last_loss:.4f}"
-            if val_loss is not None:
-                msg += f" | val {val_loss:.4f}"
+            if last_val is not None:
+                msg += f" | val {last_val:.4f}"
             tqdm.write(f"{msg} | saved {ckpt}")
     finally:
         record_f.close()

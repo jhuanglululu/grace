@@ -95,6 +95,7 @@ class TrainConfig:
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     warmup: int = 0  # 0 => auto (2% of total steps)
+    val_every: int = 500  # run validation every N optimizer steps
     device: Optional[str] = None  # None => cuda if available else cpu
     seed: int = 1337
 
