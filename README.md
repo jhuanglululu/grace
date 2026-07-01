@@ -26,20 +26,24 @@ within ~10% (GRACE's depth-attention overhead).
 ## Setup
 
 ```bash
-uv venv --python 3.12
-source .venv/bin/activate
-uv pip install torch --index-url https://download.pytorch.org/whl/cpu   # or a CUDA build on the server
-uv pip install numpy tokenizers pytest tqdm
+# CPU (local dev): pull torch from the CPU wheel index
+uv add torch --index https://download.pytorch.org/whl/cpu
+# on the L40S server instead: uv add torch   (default index = CUDA build)
+uv add numpy tokenizers datasets tqdm
+uv add --dev pytest
 ```
+
+`uv` manages the project venv automatically — prefix commands with `uv run`.
 
 ## Data
 
 Documents are concatenated (separated by `<eos>`) into one packed uint16 stream
 per split; training examples are **sliding windows** of size `max_seq_len`
-(1024) with overlap 256.
+(1024) with overlap 256. Validation holds out a fixed number of tokens (whole
+docs), not a fraction:
 
 ```bash
-python -m scripts.prepare_data --out-dir data --val-frac 0.005
+uv run python -m scripts.prepare_data --out-dir data --val-tokens 1000000
 ```
 
 ## Train
@@ -49,8 +53,8 @@ hyperparameter lives in `TrainConfig` (`grace/config.py`) so the two runs are
 identical (edit it there):
 
 ```bash
-python -m grace.train --model baseline           # -> ckpt/baseline/0/
-python -m grace.train --model grace  --seed 1     # -> ckpt/grace/1/
+uv run python -m grace.train --model baseline           # -> ckpt/baseline/0/
+uv run python -m grace.train --model grace  --seed 1     # -> ckpt/grace/1/
 ```
 
 Each run writes to `ckpt/<model>/<seed>/` (override the dir with `--out`; warns
@@ -62,13 +66,20 @@ up front if it already contains files):
 | `record.jsonl` | one line per step: `step`, `epoch`, `train_loss`, `val_loss`, `time` |
 | `epoch_{n}.pt` | checkpoint after each epoch (3 by default) |
 
-Progress is a tqdm bar (loss/lr in the postfix). Defaults: 3 epochs, bf16 on
-CUDA. Compare validation loss (`record.jsonl`) and tokens/sec.
+Progress is a tqdm bar (loss/lr in the postfix). Validation loss is estimated
+over a fixed 10 batches each epoch. Defaults: 3 epochs, bf16 on CUDA. Compare
+validation loss (`record.jsonl`) and tokens/sec.
+
+**GPU selection (shared servers):** by default the trainer queries `nvidia-smi`
+and picks the freest idle GPU (< ~1 GB used), so it won't land on a card someone
+else is training on. If every GPU is busy it aborts with a message rather than
+interfering. Override by setting `TrainConfig.device` (`"cuda:1"`, `"cpu"`) or
+the `CUDA_VISIBLE_DEVICES` env var, both of which are respected as-is.
 
 ## Test
 
 ```bash
-pytest -q
+uv run pytest -q
 ```
 
 Tests assert **properties** — shapes, finite gradients, next-token round-trip,

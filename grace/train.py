@@ -21,6 +21,7 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import time
 from dataclasses import asdict, replace
 
@@ -68,18 +69,79 @@ def cosine_lr(step: int, total: int, base: float, warmup: int, min_ratio: float 
     return base * (min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * frac)))
 
 
+# A GPU using less than this many MB is treated as free (idle cards still hold a
+# few hundred MB). Below this we assume nobody else is on it.
+GPU_FREE_MEM_MB = 1024
+
+
+def _parse_gpu_stats(csv_text: str) -> list[dict]:
+    """Parse `nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu
+    --format=csv,noheader,nounits` output into a list of dicts."""
+    stats = []
+    for line in csv_text.strip().splitlines():
+        if not line.strip():
+            continue
+        idx, used, total, util = (p.strip() for p in line.split(","))
+        stats.append({"index": int(idx), "mem_used": int(used), "mem_total": int(total), "util": int(util)})
+    return stats
+
+
+def query_gpu_stats() -> list[dict]:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    return _parse_gpu_stats(out)
+
+
+def pick_free_gpu(stats: list[dict], free_mem_mb: int = GPU_FREE_MEM_MB):
+    """Return the index of the freest idle GPU (least memory used, then least
+    utilization), or None if every GPU is already in use."""
+    free = [g for g in stats if g["mem_used"] < free_mem_mb]
+    if not free:
+        return None
+    free.sort(key=lambda g: (g["mem_used"], g["util"]))
+    return free[0]["index"]
+
+
 def resolve_device(tcfg: TrainConfig) -> str:
-    if tcfg.device is not None:
+    if tcfg.device is not None:  # explicit override wins (e.g. "cpu", "cuda:2")
         return tcfg.device
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        return "cpu"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):  # respect an externally pinned GPU
+        return "cuda"
+    stats = query_gpu_stats()
+    if not stats:  # CUDA present but nvidia-smi unavailable — let torch choose
+        print("nvidia-smi unavailable; using default cuda device")
+        return "cuda"
+    idx = pick_free_gpu(stats)
+    if idx is None:
+        busy = ", ".join(f"cuda:{g['index']}({g['mem_used']}MB)" for g in stats)
+        raise RuntimeError(
+            f"No free GPU: all in use (>= {GPU_FREE_MEM_MB}MB) [{busy}]. "
+            f"Set TrainConfig.device to override (e.g. 'cuda:1' or 'cpu')."
+        )
+    used = next(g["mem_used"] for g in stats if g["index"] == idx)
+    print(f"selected free GPU cuda:{idx} ({used}MB used of {len(stats)} GPUs)")
+    return f"cuda:{idx}"
+
+
+# Validation loss is estimated over a fixed number of batches (not a fraction of
+# the val set) so eval cost is constant regardless of corpus size.
+VAL_BATCHES = 10
 
 
 @torch.no_grad()
-def evaluate(model, val_ds: WindowedDataset, batch_size: int, device: str, max_batches: int = 50):
+def evaluate(model, val_ds: WindowedDataset, batch_size: int, device: str):
     model.eval()
     losses = []
     for i, (x, y) in enumerate(val_ds.iter_epoch(batch_size)):
-        if i >= max_batches:
+        if i >= VAL_BATCHES:
             break
         x, y = x.to(device), y.to(device)
         losses.append(loss_fn(model(x), y).item())
@@ -90,6 +152,8 @@ def evaluate(model, val_ds: WindowedDataset, batch_size: int, device: str, max_b
 def train(model_kind: str, out: str | None = None, tcfg: TrainConfig | None = None):
     tcfg = tcfg or TrainConfig()
     device = resolve_device(tcfg)
+    if device.startswith("cuda") and ":" in device:
+        torch.cuda.set_device(device)  # pin the chosen GPU for all allocations
     model, cfg = build_model(model_kind)
     model.to(device)
     n_params = count_params(model)
