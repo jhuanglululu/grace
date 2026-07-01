@@ -52,7 +52,17 @@ class GraceConfig:
     n_head: int = 8  # heads *per group* for attn layers
     d_ff: int = 1024  # SwiGLU inner width for mlp layers
     layer_types: list[str] = field(
-        default_factory=lambda: ["attn", "mlp", "attn", "mlp", "attn", "mlp", "attn", "mlp", "attn"]
+        default_factory=lambda: [
+            "attn",
+            "mlp",
+            "attn",
+            "mlp",
+            "attn",
+            "mlp",
+            "attn",
+            "mlp",
+            "attn",
+        ]
     )
     max_seq_len: int = 1024
     rope_theta: float = 10000.0
@@ -60,7 +70,9 @@ class GraceConfig:
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_head == 0, "d_model must be divisible by n_head"
-        assert all(t in ("attn", "mlp") for t in self.layer_types), "layer_types must be 'attn'/'mlp'"
+        assert all(t in ("attn", "mlp") for t in self.layer_types), (
+            "layer_types must be 'attn'/'mlp'"
+        )
 
     @property
     def head_dim(self) -> int:
@@ -88,7 +100,7 @@ class TrainConfig:
 
     data_dir: str = "data"
     epochs: int = 3
-    batch_size: int = 32
+    batch_size: int = 64
     overlap: int = 256  # sliding-window overlap (window size = model max_seq_len)
     grad_accum: int = 1
     lr: float = 3e-4
