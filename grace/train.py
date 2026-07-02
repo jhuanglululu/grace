@@ -1,11 +1,11 @@
 """Epoch-based trainer for the baseline and GRACE models.
 
-All shared hyperparameters live in ``TrainConfig`` (``grace/config.py``) so the
-two models train under identical settings — the only CLI choices are which model
+All shared hyperparameters live in ``TrainConfig`` (``grace/config.py``) so every
+model trains under identical settings — the only CLI choices are which model
 to train, the seed, and (optionally) where to write the run:
 
-    python -m grace.train --model baseline           # -> ckpt/baseline/0/
-    python -m grace.train --model grace --seed 1      # -> ckpt/grace/1/
+    python -m grace.train --model baseline            # -> ckpt/baseline/0/
+    python -m grace.train --model grace2 --seed 1      # -> ckpt/grace2/1/
 
 Each run writes to ``ckpt/<model>/<seed>/`` (override the dir with --out):
     metadata.json       train + model config and param count
@@ -81,10 +81,18 @@ def load_resume(run_dir: str, model, opt, gen, device: str) -> int:
 
     path = os.path.join(run_dir, "last.safetensors")
     flat = load_file(path, device="cpu")
-    model.load_state_dict(
+    # Only the tied lm_head may be absent (dropped on save); anything else means
+    # the checkpoint was written by a different architecture — refuse rather than
+    # silently train a hybrid (e.g. after a preset was redefined in config.py).
+    missing, unexpected = model.load_state_dict(
         {k: v for k, v in flat.items() if not k.startswith(("opt.", "rng."))},
         strict=False,
     )
+    if set(missing) - {"lm_head.weight"} or unexpected:
+        raise ValueError(
+            f"{path} does not match the current model: "
+            f"missing {sorted(set(missing) - {'lm_head.weight'})}, unexpected {sorted(unexpected)}"
+        )
     model.to(device)
     state: dict = {}
     for k, v in flat.items():
@@ -110,16 +118,31 @@ def resolve_run_dir(model_kind: str, seed: int, out: str | None = None) -> str:
     return os.path.join("ckpt", model_kind, str(seed))
 
 
+def model_family(kind: str) -> tuple[type, type]:
+    """Single source of truth for model-kind dispatch, shared with generate.py:
+    any "baseline*" or "grace*" kind (bare "grace" = round-1 checkpoints) maps
+    to its (ConfigClass, ModelClass)."""
+    if kind.startswith("baseline"):
+        return BaselineConfig, BaselineTransformer
+    if kind.startswith("grace"):
+        return GraceConfig, GraceTransformer
+    raise ValueError(f"unknown model kind {kind!r}")
+
+
+def seed_all(seed: int, device: str) -> None:
+    """Seed the global torch RNGs (and all CUDA devices when on GPU)."""
+    torch.manual_seed(seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(seed)
+
+
 def build_model(kind: str):
-    preset = f"{kind}_50m"
-    cfg = PRESETS[preset]
-    if kind == "baseline":
-        assert isinstance(cfg, BaselineConfig)
-        return BaselineTransformer(cfg), cfg
-    if kind == "grace":
-        assert isinstance(cfg, GraceConfig)
-        return GraceTransformer(cfg), cfg
-    raise ValueError(kind)
+    if kind not in PRESETS:
+        raise ValueError(f"unknown preset {kind!r}; available: {sorted(PRESETS)}")
+    cfg = PRESETS[kind]
+    cfg_cls, model_cls = model_family(kind)
+    assert isinstance(cfg, cfg_cls)
+    return model_cls(cfg), cfg
 
 
 def loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -257,9 +280,7 @@ def train(
     if device.startswith("cuda") and ":" in device:
         torch.cuda.set_device(device)  # pin the chosen GPU for all allocations
     # Seed BEFORE build_model so weight init (nn.init.normal_) is reproducible per seed.
-    torch.manual_seed(tcfg.seed)
-    if device.startswith("cuda"):
-        torch.cuda.manual_seed_all(tcfg.seed)
+    seed_all(tcfg.seed, device)
     model, cfg = build_model(model_kind)
     model.to(device)
     model.compile()
@@ -272,7 +293,18 @@ def train(
         print(
             f"WARNING: run dir {run_dir} already contains files; they may be overwritten"
         )
-    with open(os.path.join(run_dir, "metadata.json"), "w") as f:
+    meta_path = os.path.join(run_dir, "metadata.json")
+    if resuming and os.path.exists(meta_path):
+        # Refuse to resume a run written under a different model/config (e.g. a
+        # preset redefined between rounds) — before the rewrite below erases it.
+        old = json.load(open(meta_path))
+        if old.get("model") != model_kind or old.get("model_config") != asdict(cfg):
+            raise ValueError(
+                f"refusing to resume: {run_dir} was written by model "
+                f"{old.get('model')!r} with a different config than the current "
+                f"{model_kind!r} preset; use a fresh --out/--seed or restore the old preset"
+            )
+    with open(meta_path, "w") as f:
         json.dump(
             {
                 "model": model_kind,
@@ -482,7 +514,10 @@ def main():
     p = argparse.ArgumentParser(
         description="Train the baseline or GRACE model (shared TrainConfig)."
     )
-    p.add_argument("--model", choices=["baseline", "grace"], required=True)
+    # Trainable kinds = the non-test presets, so a new preset is a CLI choice
+    # (and gets test coverage in tests/test_params.py) without further edits.
+    p.add_argument("--model", choices=[k for k in PRESETS if not k.endswith("_tiny")],
+                   required=True)
     p.add_argument(
         "--out", default=None, help="run directory (default ckpt/<model>/<seed>/)"
     )

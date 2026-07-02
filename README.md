@@ -20,8 +20,21 @@ See [`claude.md`](claude.md) for the architecture rationale.
 | `scripts/prepare_data.py` | download + tokenize + pack the corpus |
 | `tests/` | shape / gradient / round-trip / causality property tests |
 
-Both presets are ~50.4M params (matched to <0.4%); forward matmul FLOPs match to
-within ~10% (GRACE's depth-attention overhead).
+The presets are **block-matched**: all three models are built from the same 24
+blocks (12 attn + 12 mlp, d_model=512, d_ff=1472) and differ only in wiring —
+a **flattening sweep** (24 divides by 2 and 3):
+
+| preset | wiring | depth |
+|--------|--------|-------|
+| `baseline` | 24 blocks chained sequentially | 12 layers × [attn, mlp] |
+| `grace2` | flattened 2-wide | 12 alternating layers × 2 groups |
+| `grace3` | flattened 3-wide | 8 alternating layers × 3 groups |
+
+Each GRACE variant adds only its zero-init depth-attention queries, so all
+three are ~44M params (matched to <0.05%) with FLOPs/token within ~1% — the
+sweep isolates how quality and decode speed change as sequential depth is
+traded for parallel width. See the `grace/config.py` docstring for the
+rationale and the earlier ~50M parameter-matched round.
 
 ## Setup
 
@@ -30,6 +43,7 @@ within ~10% (GRACE's depth-attention overhead).
 uv add torch --index https://download.pytorch.org/whl/cpu
 # on the L40S server instead: uv add torch   (default index = CUDA build)
 uv add numpy tokenizers datasets tqdm
+uv add torchao   # weight-only int8 for `generate.py --dtype int8`
 uv add --dev pytest
 ```
 
@@ -53,8 +67,9 @@ hyperparameter lives in `TrainConfig` (`grace/config.py`) so the two runs are
 identical (edit it there):
 
 ```bash
-uv run python -m grace.train --model baseline           # -> ckpt/baseline/0/
-uv run python -m grace.train --model grace  --seed 1     # -> ckpt/grace/1/
+uv run python -m grace.train --model baseline            # -> ckpt/baseline/0/
+uv run python -m grace.train --model grace2               # -> ckpt/grace2/0/
+uv run python -m grace.train --model grace3 --seed 1      # -> ckpt/grace3/1/
 ```
 
 Each run writes to `ckpt/<model>/<seed>/` (override the dir with `--out`):
@@ -72,7 +87,7 @@ Resume an interrupted run with `--resume` (loads `last.safetensors`, continues a
 epoch granularity):
 
 ```bash
-uv run python -m grace.train --model grace --resume
+uv run python -m grace.train --model grace2 --resume
 ```
 
 Progress is a tqdm bar (train loss, lr, and latest val loss in the postfix).
@@ -93,7 +108,7 @@ Sample from a checkpoint — the architecture is read from the run's
 needed. Point it at a `best.json`-listed checkpoint or `last.safetensors`:
 
 ```bash
-uv run scripts/generate.py --ckpt-path ckpt/grace/0/last.safetensors \
+uv run scripts/generate.py --ckpt-path ckpt/grace2/0/last.safetensors \
     --prompt "台灣" --rep-pen 1.2 --seed 0
 ```
 
@@ -112,8 +127,17 @@ By default `--device` auto-picks a free GPU (same `nvidia-smi` logic as
 training); pass `--device cpu`/`cuda:1` to override.
 
 Flags: `--prompt` (empty starts from a document boundary), `--rep-pen`
-(repetition penalty, 1.0 = off), `--seed`, plus `--temperature`, `--top-k`,
-`--max-new-tokens`, `--device`.
+(repetition penalty, 1.0 = off), `--seed` (one seed or a comma-separated list
+like `0,42,67` — each generates once from the same loaded/quantized/compiled
+model, printing per-seed output + stats and a pooled tok/s average), plus
+`--temperature`, `--top-k`,
+`--max-new-tokens`, `--device`, `--compile` (auto/on/off — torch.compile both
+models; auto = on for CUDA, and the biggest lever on the decode numbers), and
+`--dtype` (`f32` default | `f16` | `bf16` | `int8`). Below-f32 dtypes shrink
+weight and KV-cache traffic — the main bottleneck at batch-1 — and sampling
+always runs in fp32. `int8` is torchao weight-only quantization over bf16
+activations (CUDA recommended; the tied embedding stays bf16). Checkpoints
+themselves are always saved fp32.
 
 ## Test
 

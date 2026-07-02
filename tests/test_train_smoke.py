@@ -17,6 +17,13 @@ from grace.config import TrainConfig
 from grace.data import write_bin
 from grace.train import train
 
+# Every non-test preset is trainable and gets smoke coverage automatically.
+TRAINABLE = [k for k in config.PRESETS if not k.endswith("_tiny")]
+
+
+def _tiny_for(model: str) -> str:
+    return "grace_tiny" if isinstance(config.PRESETS[model], config.GraceConfig) else "baseline_tiny"
+
 
 def _write_data(tmp_path, vocab=64, n=6000):
     rng = np.random.default_rng(0)
@@ -29,10 +36,10 @@ def _tcfg(tmp_path, epochs):
                        overlap=8, device="cpu", seed=0)
 
 
-@pytest.mark.parametrize("model", ["baseline", "grace"])
+@pytest.mark.parametrize("model", TRAINABLE)
 def test_train_writes_safetensors_artifacts(tmp_path, monkeypatch, model):
     _write_data(tmp_path)
-    monkeypatch.setitem(config.PRESETS, f"{model}_50m", config.PRESETS[f"{model}_tiny"])
+    monkeypatch.setitem(config.PRESETS, model, config.PRESETS[_tiny_for(model)])
     run_dir = str(tmp_path / "run")
     train(model, tcfg=_tcfg(tmp_path, epochs=2), out=run_dir)
 
@@ -60,14 +67,14 @@ def test_train_writes_safetensors_artifacts(tmp_path, monkeypatch, model):
 
 def test_resume_continues_from_last(tmp_path, monkeypatch):
     _write_data(tmp_path)
-    monkeypatch.setitem(config.PRESETS, "grace_50m", config.PRESETS["grace_tiny"])
+    monkeypatch.setitem(config.PRESETS, "grace2", config.PRESETS["grace_tiny"])
     run_dir = str(tmp_path / "run")
 
-    train("grace", tcfg=_tcfg(tmp_path, epochs=1), out=run_dir)
+    train("grace2", tcfg=_tcfg(tmp_path, epochs=1), out=run_dir)
     with safe_open(os.path.join(run_dir, "last.safetensors"), framework="pt") as f:
         assert f.metadata()["resume_epoch"] == "1"  # epoch 0 completed
 
     # resume with a larger epoch budget: should start at epoch 1 and finish it
-    train("grace", tcfg=_tcfg(tmp_path, epochs=2), out=run_dir, resume=True)
+    train("grace2", tcfg=_tcfg(tmp_path, epochs=2), out=run_dir, resume=True)
     with safe_open(os.path.join(run_dir, "last.safetensors"), framework="pt") as f:
         assert f.metadata()["resume_epoch"] == "2"

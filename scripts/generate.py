@@ -4,8 +4,8 @@ The model architecture/config is read from ``metadata.json`` in the checkpoint's
 run directory (written by the trainer), so only the checkpoint path is needed.
 
 Usage (either form works):
-    uv run scripts/generate.py --ckpt-path ckpt/grace/0/last.safetensors --prompt "台灣" --rep-pen 1.2
-    uv run python -m scripts.generate --ckpt-path ckpt/grace/0/last.safetensors
+    uv run scripts/generate.py --ckpt-path ckpt/grace2/0/last.safetensors --prompt "台灣" --rep-pen 1.2
+    uv run python -m scripts.generate --ckpt-path ckpt/grace2/0/last.safetensors
 """
 
 from __future__ import annotations
@@ -22,25 +22,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn.functional as F
 
-from grace.config import BaselineConfig, GraceConfig, TrainConfig
-from grace.model_baseline import BaselineTransformer
-from grace.model_grace import GraceTransformer
+from grace.config import TrainConfig
 from grace.tokenizer import GraceTokenizer
-from grace.train import resolve_device
+from grace.train import model_family, resolve_device, seed_all
 
 # Tokens generated in the untimed warmup pass (exercises prefill + decode kernels).
 WARMUP_TOKENS = 8
 
 
 def config_from_metadata(meta: dict):
-    """Rebuild the (kind, config) pair from a run's metadata.json."""
-    kind = meta["model"]
-    mc = meta["model_config"]
-    if kind == "baseline":
-        return kind, BaselineConfig(**mc)
-    if kind == "grace":
-        return kind, GraceConfig(**mc)
-    raise ValueError(f"unknown model kind {kind!r}")
+    """Rebuild the (ModelClass, config) pair from a run's metadata.json.
+    Kind dispatch lives in grace.train.model_family — one source of truth."""
+    cfg_cls, model_cls = model_family(meta["model"])
+    return model_cls, cfg_cls(**meta["model_config"])
 
 
 def load_model(ckpt_path: str, device: str = "cpu"):
@@ -49,8 +43,8 @@ def load_model(ckpt_path: str, device: str = "cpu"):
     meta_path = os.path.join(os.path.dirname(ckpt_path), "metadata.json")
     with open(meta_path) as f:
         meta = json.load(f)
-    kind, cfg = config_from_metadata(meta)
-    model = BaselineTransformer(cfg) if kind == "baseline" else GraceTransformer(cfg)
+    model_cls, cfg = config_from_metadata(meta)
+    model = model_cls(cfg)
     flat = load_file(ckpt_path, device="cpu")
     # last.safetensors carries extra optimizer/RNG tensors that are not model params.
     state = {k: v for k, v in flat.items() if not k.startswith(("opt.", "rng."))}
@@ -59,7 +53,7 @@ def load_model(ckpt_path: str, device: str = "cpu"):
     missing, unexpected = model.load_state_dict(state, strict=False)
     if set(missing) - {"lm_head.weight"} or unexpected:
         raise ValueError(
-            f"checkpoint {ckpt_path!r} does not match a {kind!r} model: "
+            f"checkpoint {ckpt_path!r} does not match a {meta['model']!r} model: "
             f"missing keys {sorted(set(missing) - {'lm_head.weight'})}, "
             f"unexpected keys {sorted(unexpected)}"
         )
@@ -80,6 +74,7 @@ def apply_rep_pen(logits: torch.Tensor, prev_ids, pen: float) -> torch.Tensor:
 
 
 def _sample(logits: torch.Tensor, prev_ids, temperature: float, top_k: int, rep_pen: float) -> int:
+    logits = logits.float()  # sample in fp32 regardless of model dtype (8k vocab — cheap)
     logits = apply_rep_pen(logits, prev_ids, rep_pen)
     if temperature <= 0:  # greedy
         return int(logits.argmax())
@@ -96,6 +91,20 @@ def _sync(device: str):
         torch.cuda.synchronize()
 
 
+def _seed_list(arg: str) -> list[int]:
+    """argparse type for --seed: one int or a comma-separated list of ints."""
+    try:
+        return [int(s) for s in arg.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an int or comma-separated ints (e.g. 0,42,67), got {arg!r}"
+        )
+
+
+def _rate(tokens: int, seconds: float) -> float:
+    return tokens / max(seconds, 1e-9)
+
+
 @torch.no_grad()
 def generate_ids(
     model,
@@ -108,6 +117,7 @@ def generate_ids(
     max_seq_len: int = 1024,
     device: str = "cpu",
     return_timing: bool = False,
+    warn: bool = True,
 ):
     """Autoregressively sample using a KV cache; returns the new ids (and, if
     ``return_timing``, a stats dict with separate prefill/decode/sample timings).
@@ -120,10 +130,11 @@ def generate_ids(
     ids = list(prompt_ids)
     if len(ids) >= max_seq_len:  # keep room to generate at least one token
         ids = ids[-(max_seq_len - 1):]
-        print(f"warning: prompt truncated to its last {len(ids)} tokens "
-              f"(max_seq_len={max_seq_len})", file=sys.stderr)
+        if warn:
+            print(f"warning: prompt truncated to its last {len(ids)} tokens "
+                  f"(max_seq_len={max_seq_len})", file=sys.stderr)
     room = max_seq_len - len(ids)
-    if room < max_new_tokens:
+    if warn and room < max_new_tokens:
         print(f"warning: context window leaves room for only {room} of "
               f"{max_new_tokens} requested tokens", file=sys.stderr)
     caches = model.init_kv_cache()
@@ -179,24 +190,41 @@ def main():
     p.add_argument("--ckpt-path", required=True, help="path to a .safetensors checkpoint (metadata.json must sit beside it)")
     p.add_argument("--prompt", default="", help="conditioning text (empty => start from a doc boundary)")
     p.add_argument("--rep-pen", type=float, default=1.1, help="repetition penalty (1.0 = off)")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=_seed_list, default=[0],
+                   help="random seed, or comma-separated list (e.g. 0,42,67): each seed "
+                        "generates once from the same loaded/quantized/compiled model, "
+                        "with per-seed stats plus a pooled average")
     p.add_argument("--max-new-tokens", type=int, default=200)
     p.add_argument("--temperature", type=float, default=0.8, help="0 => greedy")
     p.add_argument("--top-k", type=int, default=50, help="0 => no top-k")
     p.add_argument("--device", default=None, help="default: auto-pick a free GPU (see train.resolve_device)")
     p.add_argument("--compile", choices=["auto", "on", "off"], default="auto",
                    help="torch.compile the model to fuse kernels (auto = on for CUDA)")
+    p.add_argument("--dtype", choices=["f32", "f16", "bf16", "int8"], default="f32",
+                   help="weight/activation precision; halves KV-cache traffic below f32. "
+                        "int8 = torchao weight-only quant over bf16 activations (CUDA recommended)")
     args = p.parse_args()
 
+    seeds = args.seed
     device = resolve_device(TrainConfig(device=args.device))
     if device.startswith("cuda") and ":" in device:
         torch.cuda.set_device(device)
-    torch.manual_seed(args.seed)
-    if device.startswith("cuda"):
-        torch.cuda.manual_seed_all(args.seed)
 
     tok = GraceTokenizer()
     model, cfg = load_model(args.ckpt_path, device)
+
+    # Cast BEFORE compile so kernels are generated for the final dtype. The KV
+    # cache and pool buffer inherit the activation dtype, so f16/bf16 also halve
+    # cache traffic. RMSNorm computes in fp32 internally either way.
+    if args.dtype in ("f16", "bf16"):
+        model = model.to(torch.float16 if args.dtype == "f16" else torch.bfloat16)
+    elif args.dtype == "int8":
+        # weight-only int8 (per-channel scales) on bf16 activations; the tied
+        # embedding stays bf16 (torchao only rewrites nn.Linear weights).
+        from torchao.quantization import Int8WeightOnlyConfig, quantize_
+
+        model = model.to(torch.bfloat16)
+        quantize_(model, Int8WeightOnlyConfig())
 
     # Fuse the many small ops (norms, softmax, rope, depth-attention) into few
     # kernels. This is where GRACE's fewer-layers advantage shows up: eager launch
@@ -227,30 +255,49 @@ def main():
     generate_ids(
         model, prompt_ids, max_new_tokens=WARMUP_TOKENS,
         temperature=0.0, top_k=0, rep_pen=1.0, eos_id=None,
-        max_seq_len=cfg.max_seq_len, device=device,
+        max_seq_len=cfg.max_seq_len, device=device, warn=False,
     )
 
-    # Re-seed after warmup so --seed still determines the actual output.
-    torch.manual_seed(args.seed)
-    if device.startswith("cuda"):
-        torch.cuda.manual_seed_all(args.seed)
+    # One generation per seed, re-seeding before each so every --seed value
+    # determines its own output; the model stays loaded/quantized/compiled.
+    totals = {"prefill_tokens": 0, "prefill_time": 0.0, "decode_tokens": 0,
+              "decode_time": 0.0, "new_tokens": 0, "sample_time": 0.0}
+    for i, seed in enumerate(seeds):
+        seed_all(seed, device)
+        gen_ids, s = generate_ids(model, prompt_ids, max_new_tokens=args.max_new_tokens,
+                                  return_timing=True, warn=(i == 0), **common)
+        for k in totals:
+            totals[k] += s[k]
 
-    gen_ids, s = generate_ids(model, prompt_ids, max_new_tokens=args.max_new_tokens, return_timing=True, **common)
+        if len(seeds) > 1:
+            if i:
+                print()
+            print(f"--- seed {seed} ---")
+        print(args.prompt + tok.decode(gen_ids))
+        pt, dt, st = s["prefill_time"], s["decode_time"], s["sample_time"]
+        print(
+            f"\n[prefill: {s['prefill_tokens']} tok in {pt * 1e3:.1f}ms = "
+            f"{_rate(s['prefill_tokens'], pt):.1f} tok/s]"
+        )
+        print(
+            f"[decode:  {s['decode_tokens']} tok in {dt:.3f}s = "
+            f"{_rate(s['decode_tokens'], dt):.1f} tok/s on {device}, {args.dtype} (model forward only)]"
+        )
+        print(
+            f"[end-to-end: {s['new_tokens']} tok in {dt + st:.3f}s = "
+            f"{_rate(s['new_tokens'], dt + st):.1f} tok/s (forward + sampling)]"
+        )
 
-    print(args.prompt + tok.decode(gen_ids))
-    pt, dt, st = s["prefill_time"], s["decode_time"], s["sample_time"]
-    print(
-        f"\n[prefill: {s['prefill_tokens']} tok in {pt * 1e3:.1f}ms = "
-        f"{s['prefill_tokens'] / max(pt, 1e-9):.1f} tok/s]"
-    )
-    print(
-        f"[decode:  {s['decode_tokens']} tok in {dt:.3f}s = "
-        f"{s['decode_tokens'] / max(dt, 1e-9):.1f} tok/s on {device} (model forward only)]"
-    )
-    print(
-        f"[end-to-end: {s['new_tokens']} tok in {dt + st:.3f}s = "
-        f"{s['new_tokens'] / max(dt + st, 1e-9):.1f} tok/s (forward + sampling)]"
-    )
+    if len(seeds) > 1:
+        # Pooled (total tokens / total time), not a mean of rates — robust to
+        # runs of different lengths (early EOS).
+        pt, dt, st = totals["prefill_time"], totals["decode_time"], totals["sample_time"]
+        print(
+            f"\n[average over {len(seeds)} seeds (pooled): "
+            f"prefill {_rate(totals['prefill_tokens'], pt):.1f} tok/s | "
+            f"decode {_rate(totals['decode_tokens'], dt):.1f} tok/s | "
+            f"end-to-end {_rate(totals['new_tokens'], dt + st):.1f} tok/s]"
+        )
 
 
 if __name__ == "__main__":

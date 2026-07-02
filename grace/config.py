@@ -1,10 +1,24 @@
 """Model configurations for the baseline transformer and GRACE.
 
-Both presets are tuned to ~50M parameters. Because total matmul FLOPs for a
-dense LM are ~= 2 * (non-embedding params) * tokens (the "6ND" rule), matching
-non-embedding parameter count also matches FLOPs to within GRACE's small
-depth-attention overhead (2 * G * pool * d per token per layer, a few percent).
-Use ``count_params`` / ``estimate_flops_per_token`` in ``grace.utils`` to check.
+The presets are **block-matched**: all three models are built from the same 24
+blocks (12 attn + 12 mlp) with identical dimensions (d_model=512, d_ff=1472,
+8 heads); they differ only in how those blocks are wired. 24 was chosen
+because it divides by 2 and 3, giving a **flattening sweep** at fixed blocks:
+
+- ``baseline`` — the 24 blocks chained sequentially (12 layers x [attn, mlp]).
+- ``grace2``   — the same stack flattened 2-wide: 12 alternating layers x 2 groups.
+- ``grace3``   — flattened 3-wide: 8 alternating layers x 3 groups.
+
+Each GRACE variant adds only its zero-init depth-attention queries (<0.05% of
+params), so all three land at ~44M params matched to <0.05% with matmul
+FLOPs/token within ~1%. Any quality difference across the sweep is purely the
+topology — how much sequential depth was traded for parallel width. An earlier
+round compared a single 4-wide GRACE against a 14-layer baseline at ~50M
+parameter-matched (d_ff 1024 vs 1472); GRACE trailed by ~0.035 val loss, which
+this round tests as a d_ff-capacity artifact while measuring how quality
+scales with G.
+Use ``count_params`` and ``baseline_flops_per_token`` /
+``grace_flops_per_token`` in ``grace.utils`` to check.
 """
 
 from __future__ import annotations
@@ -25,7 +39,7 @@ class BaselineConfig:
 
     vocab_size: int = 8192
     d_model: int = 512
-    n_layer: int = 14
+    n_layer: int = 12
     n_head: int = 8
     d_ff: int = 1472  # SwiGLU inner width
     max_seq_len: int = 1024
@@ -45,27 +59,17 @@ class GraceConfig:
     outputs; outputs append to the pool instead of merging.
 
     ``layer_types`` lists one entry per layer, each ``"attn"`` or ``"mlp"``.
-    Default is strict alternation starting (and, for odd counts, ending) with
-    attention, as described in ``claude.md``.
+    Default is strict alternation starting with attention and ending with mlp,
+    as described in ``claude.md``.
     """
 
     vocab_size: int = 8192
     d_model: int = 512
-    groups: int = 4  # G — parallel groups per layer
+    groups: int = 2  # G — parallel groups per layer
     n_head: int = 8  # heads *per group* for attn layers
-    d_ff: int = 1024  # SwiGLU inner width for mlp layers
+    d_ff: int = 1472  # SwiGLU inner width for mlp layers (== baseline's, see module docstring)
     layer_types: list[str] = field(
-        default_factory=lambda: [
-            "attn",
-            "mlp",
-            "attn",
-            "mlp",
-            "attn",
-            "mlp",
-            "attn",
-            "mlp",
-            "attn",
-        ]
+        default_factory=lambda: ["attn", "mlp"] * 6
     )
     max_seq_len: int = 1024
 
@@ -112,8 +116,9 @@ class TrainConfig:
 
 
 PRESETS: dict[str, object] = {
-    "baseline_50m": BaselineConfig(),
-    "grace_50m": GraceConfig(),
+    "baseline": BaselineConfig(),  # 12 sequential layers = 24 sublayers
+    "grace2": GraceConfig(),  # 2-wide: 12 layers x 2 groups = 24 blocks
+    "grace3": GraceConfig(groups=3, layer_types=["attn", "mlp"] * 4),  # 3-wide: 8 layers x 3 groups
     # Tiny configs used by the test-suite for fast CPU verification.
     "baseline_tiny": BaselineConfig(
         vocab_size=64, d_model=32, n_layer=3, n_head=4, d_ff=48, max_seq_len=32
