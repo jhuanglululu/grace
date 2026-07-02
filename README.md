@@ -129,7 +129,8 @@ training); pass `--device cpu`/`cuda:1` to override.
 Flags: `--prompt` (empty starts from a document boundary), `--rep-pen`
 (repetition penalty, 1.0 = off), `--seed` (one seed or a comma-separated list
 like `0,42,67` — each generates once from the same loaded/quantized/compiled
-model, printing per-seed output + stats and a pooled tok/s average), plus
+model, printing per-seed stats and a pooled tok/s average), `--show-output`
+(print the generated text too; default is statistics only), plus
 `--temperature`, `--top-k`,
 `--max-new-tokens`, `--device`, `--compile` (auto/on/off — torch.compile both
 models; auto = on for CUDA, and the biggest lever on the decode numbers), and

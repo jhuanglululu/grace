@@ -192,6 +192,8 @@ def main():
                    help="random seed, or comma-separated list (e.g. 0,42,67): each seed "
                         "generates once from the same loaded/quantized/compiled model, "
                         "with per-seed stats plus a pooled average")
+    p.add_argument("--show-output", action="store_true",
+                   help="print the generated text (default: statistics only)")
     p.add_argument("--max-new-tokens", type=int, default=200)
     p.add_argument("--temperature", type=float, default=0.8, help="0 => greedy")
     p.add_argument("--top-k", type=int, default=50, help="0 => no top-k")
@@ -274,10 +276,11 @@ def main():
             if i:
                 print()
             print(f"--- seed {seed} ---")
-        print(args.prompt + tok.decode(gen_ids))
+        if args.show_output:
+            print(args.prompt + tok.decode(gen_ids) + "\n")
         pt, dt, st = s["prefill_time"], s["decode_time"], s["sample_time"]
         print(
-            f"\n[prefill: {s['prefill_tokens']} tok in {pt * 1e3:.1f}ms = "
+            f"[prefill: {s['prefill_tokens']} tok in {pt * 1e3:.1f}ms = "
             f"{_rate(s['prefill_tokens'], pt):.1f} tok/s]"
         )
         print(
