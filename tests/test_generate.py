@@ -45,7 +45,7 @@ def test_checkpoint_roundtrip(tmp_path):
 def test_generate_is_deterministic_and_bounded():
     model = GraceTransformer(PRESETS["grace_tiny"]).eval()
     prompt = [1, 2, 3]
-    kw = dict(max_new_tokens=6, temperature=0.9, top_k=5, rep_pen=1.1, eos_id=None, max_seq_len=32)
+    kw = dict(max_new_tokens=6, temperature=0.9, top_k=5, rep_pen=1.1, max_seq_len=32)
 
     torch.manual_seed(0)
     a = generate_ids(model, prompt, **kw)
@@ -53,11 +53,11 @@ def test_generate_is_deterministic_and_bounded():
     b = generate_ids(model, prompt, **kw)
 
     assert a == b                      # same seed -> same sample
-    assert len(a) == 6                 # no eos -> exactly max_new_tokens, prompt excluded
+    assert len(a) == 6                 # exactly max_new_tokens, prompt excluded
     assert all(0 <= t < PRESETS["grace_tiny"].vocab_size for t in a)
 
 
 def test_greedy_generation_needs_no_seed():
     model = GraceTransformer(PRESETS["grace_tiny"]).eval()
-    kw = dict(max_new_tokens=5, temperature=0.0, top_k=0, rep_pen=1.0, eos_id=None, max_seq_len=32)
+    kw = dict(max_new_tokens=5, temperature=0.0, top_k=0, rep_pen=1.0, max_seq_len=32)
     assert generate_ids(model, [1, 2], **kw) == generate_ids(model, [1, 2], **kw)

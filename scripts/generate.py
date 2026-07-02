@@ -113,7 +113,6 @@ def generate_ids(
     temperature: float = 0.8,
     top_k: int = 50,
     rep_pen: float = 1.1,
-    eos_id: int | None = None,
     max_seq_len: int = 1024,
     device: str = "cpu",
     return_timing: bool = False,
@@ -125,7 +124,8 @@ def generate_ids(
     The prompt is prefilled in one pass, then each subsequent token is a single-
     token forward against the growing cache (O(1) attention per step). No decode
     forward is run after the final token, so the timing is not skewed by wasted work.
-    A sampled EOS stops generation and is not included in the returned ids.
+    A sampled EOS does NOT stop generation — this is a benchmark, and every run
+    producing exactly ``max_new_tokens`` keeps tok/s comparable across models/seeds.
     """
     ids = list(prompt_ids)
     if len(ids) >= max_seq_len:  # keep room to generate at least one token
@@ -157,8 +157,6 @@ def generate_ids(
         t0 = time.perf_counter()
         nxt = _sample(logits, ids, temperature, top_k, rep_pen)
         sample_time += time.perf_counter() - t0
-        if eos_id is not None and nxt == eos_id:
-            break  # stop cleanly; the eos itself is not part of the output
         ids.append(nxt)
         new.append(nxt)
         if len(new) >= max_new_tokens:
@@ -224,10 +222,12 @@ def main():
     elif args.dtype == "int8":
         # weight-only int8 (per-channel scales) on bf16 activations; the tied
         # embedding stays bf16 (torchao only rewrites nn.Linear weights).
+        # version=2 (Int8Tensor): version 1's AffineQuantizedTensor is deprecated
+        # (github.com/pytorch/ao/issues/2752); PerRow == v1's per-channel scales.
         from torchao.quantization import Int8WeightOnlyConfig, quantize_
 
         model = model.to(torch.bfloat16)
-        quantize_(model, Int8WeightOnlyConfig())
+        quantize_(model, Int8WeightOnlyConfig(version=2))
 
     # Fuse the many small ops (norms, softmax, rope, depth-attention) into few
     # kernels. This is where GRACE's fewer-layers advantage shows up: eager launch
@@ -248,16 +248,14 @@ def main():
 
     common = dict(
         temperature=args.temperature, top_k=args.top_k, rep_pen=args.rep_pen,
-        eos_id=tok.eos_id, max_seq_len=cfg.max_seq_len, device=device,
+        max_seq_len=cfg.max_seq_len, device=device,
     )
 
     # Warm up (compile + kernel autotune / allocation) so the timed run measures
-    # steady state. Force greedy with no EOS stop so warmup ALWAYS runs the full
-    # decode path (not cut short by an early EOS), guaranteeing the decode shape
-    # is compiled before timing. This is a benchmark, not a chatbot — accuracy first.
+    # steady state, guaranteeing the decode shape is compiled before timing.
     generate_ids(
         model, prompt_ids, max_new_tokens=WARMUP_TOKENS,
-        temperature=0.0, top_k=0, rep_pen=1.0, eos_id=None,
+        temperature=0.0, top_k=0, rep_pen=1.0,
         max_seq_len=cfg.max_seq_len, device=device, warn=False,
     )
 
@@ -293,7 +291,7 @@ def main():
 
     if len(seeds) > 1:
         # Pooled (total tokens / total time), not a mean of rates — robust to
-        # runs of different lengths (early EOS).
+        # runs of different lengths (a prompt near max_seq_len leaves less room).
         pt, dt, st = totals["prefill_time"], totals["decode_time"], totals["sample_time"]
         print(
             f"\n[average over {len(seeds)} seeds (pooled): "
