@@ -9,6 +9,8 @@ because it divides by 2, 3, and 4, giving a **flattening sweep** at fixed blocks
 - ``grace2``   — the same stack flattened 2-wide: 12 alternating layers x 2 groups.
 - ``grace3``   — flattened 3-wide: 8 alternating layers x 3 groups.
 - ``grace4``   — flattened 4-wide: 6 alternating layers x 4 groups.
+- ``grace6``   — flattened 6-wide: 4 alternating layers x 6 groups.
+- ``grace12``  — flattened 12-wide: 2 alternating layers x 12 groups.
 
 Each GRACE variant adds only its zero-init depth-attention queries (<0.05% of
 params), so all three land at ~44M params matched to <0.05% with matmul
@@ -121,6 +123,8 @@ PRESETS: dict[str, object] = {
     "grace2": GraceConfig(),  # 2-wide: 12 layers x 2 groups = 24 blocks
     "grace3": GraceConfig(groups=3, layer_types=["attn", "mlp"] * 4),  # 3-wide: 8 layers x 3 groups
     "grace4": GraceConfig(groups=4, layer_types=["attn", "mlp"] * 3),  # 4-wide: 6 layers x 4 groups
+    "grace6": GraceConfig(groups=6, layer_types=["attn", "mlp"] * 2),  # 6-wide: 4 layers x 6 groups
+    "grace12": GraceConfig(groups=12, layer_types=["attn", "mlp"]),  # 12-wide: 2 layers x 12 groups
     # Tiny configs used by the test-suite for fast CPU verification.
     "baseline_tiny": BaselineConfig(
         vocab_size=64, d_model=32, n_layer=3, n_head=4, d_ff=48, max_seq_len=32
