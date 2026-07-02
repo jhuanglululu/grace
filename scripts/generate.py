@@ -322,7 +322,7 @@ def main():
             prompt_ids,
             max_new_tokens=args.max_new_tokens,
             return_timing=True,
-            warn=(i == 0),
+            warn=False,
             **common,
         )
         for k in totals:
