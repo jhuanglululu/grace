@@ -52,10 +52,17 @@ def load_model(ckpt_path: str, device: str = "cpu"):
     kind, cfg = config_from_metadata(meta)
     model = BaselineTransformer(cfg) if kind == "baseline" else GraceTransformer(cfg)
     flat = load_file(ckpt_path, device="cpu")
-    # strict=False: lm_head is tied (absent from the file), and last.safetensors
-    # carries extra optimizer/RNG tensors that are not model params.
-    model.load_state_dict({k: v for k, v in flat.items() if not k.startswith(("opt.", "rng."))},
-                          strict=False)
+    # last.safetensors carries extra optimizer/RNG tensors that are not model params.
+    state = {k: v for k, v in flat.items() if not k.startswith(("opt.", "rng."))}
+    # Only the tied lm_head may legitimately be absent from the file (dropped on
+    # save, re-tied in __init__); anything else means a mismatched checkpoint.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if set(missing) - {"lm_head.weight"} or unexpected:
+        raise ValueError(
+            f"checkpoint {ckpt_path!r} does not match a {kind!r} model: "
+            f"missing keys {sorted(set(missing) - {'lm_head.weight'})}, "
+            f"unexpected keys {sorted(unexpected)}"
+        )
     model.to(device).eval()
     return model, cfg
 
@@ -103,13 +110,22 @@ def generate_ids(
     return_timing: bool = False,
 ):
     """Autoregressively sample using a KV cache; returns the new ids (and, if
-    ``return_timing``, a stats dict with separate prefill/decode timings).
+    ``return_timing``, a stats dict with separate prefill/decode/sample timings).
 
     The prompt is prefilled in one pass, then each subsequent token is a single-
     token forward against the growing cache (O(1) attention per step). No decode
     forward is run after the final token, so the timing is not skewed by wasted work.
+    A sampled EOS stops generation and is not included in the returned ids.
     """
-    ids = list(prompt_ids)[-max_seq_len:]
+    ids = list(prompt_ids)
+    if len(ids) >= max_seq_len:  # keep room to generate at least one token
+        ids = ids[-(max_seq_len - 1):]
+        print(f"warning: prompt truncated to its last {len(ids)} tokens "
+              f"(max_seq_len={max_seq_len})", file=sys.stderr)
+    room = max_seq_len - len(ids)
+    if room < max_new_tokens:
+        print(f"warning: context window leaves room for only {room} of "
+              f"{max_new_tokens} requested tokens", file=sys.stderr)
     caches = model.init_kv_cache()
 
     ctx = torch.tensor([ids], dtype=torch.long, device=device)
@@ -124,11 +140,17 @@ def generate_ids(
     new: list[int] = []
     decode_time = 0.0
     decode_steps = 0
+    sample_time = 0.0
     while len(new) < max_new_tokens and pos < max_seq_len:
+        # int() inside _sample forces a device sync, so this timing is honest.
+        t0 = time.perf_counter()
         nxt = _sample(logits, ids, temperature, top_k, rep_pen)
+        sample_time += time.perf_counter() - t0
+        if eos_id is not None and nxt == eos_id:
+            break  # stop cleanly; the eos itself is not part of the output
         ids.append(nxt)
         new.append(nxt)
-        if (eos_id is not None and nxt == eos_id) or len(new) >= max_new_tokens:
+        if len(new) >= max_new_tokens:
             break  # don't run a decode step whose logits we'd never use
         tok = torch.tensor([[nxt]], dtype=torch.long, device=device)
         _sync(device)
@@ -145,6 +167,8 @@ def generate_ids(
             "prefill_time": prefill_time,
             "decode_tokens": decode_steps,
             "decode_time": decode_time,
+            "new_tokens": len(new),
+            "sample_time": sample_time,
         }
         return new, stats
     return new
@@ -214,14 +238,18 @@ def main():
     gen_ids, s = generate_ids(model, prompt_ids, max_new_tokens=args.max_new_tokens, return_timing=True, **common)
 
     print(args.prompt + tok.decode(gen_ids))
-    pt, dt = s["prefill_time"], s["decode_time"]
+    pt, dt, st = s["prefill_time"], s["decode_time"], s["sample_time"]
     print(
         f"\n[prefill: {s['prefill_tokens']} tok in {pt * 1e3:.1f}ms = "
         f"{s['prefill_tokens'] / max(pt, 1e-9):.1f} tok/s]"
     )
     print(
         f"[decode:  {s['decode_tokens']} tok in {dt:.3f}s = "
-        f"{s['decode_tokens'] / max(dt, 1e-9):.1f} tok/s on {device}]"
+        f"{s['decode_tokens'] / max(dt, 1e-9):.1f} tok/s on {device} (model forward only)]"
+    )
+    print(
+        f"[end-to-end: {s['new_tokens']} tok in {dt + st:.3f}s = "
+        f"{s['new_tokens'] / max(dt + st, 1e-9):.1f} tok/s (forward + sampling)]"
     )
 
 
