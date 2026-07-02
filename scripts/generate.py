@@ -301,7 +301,7 @@ def main():
     # first seed's numbers and skews the pooled average. Seeding with seeds[0]
     # makes the warmup a bit-identical rehearsal of the first timed run.
     seed_all(seeds[0], device)
-    _, _ = generate_ids(
+    _ = generate_ids(
         model, prompt_ids, max_new_tokens=args.max_new_tokens, warn=False, **common
     )
 
