@@ -50,8 +50,11 @@ TOP_K_CKPTS = 3  # keep the best-K checkpoints by validation loss
 def _model_tensors(model) -> dict:
     """Model weights for a safetensors checkpoint (drop the tied lm_head, which
     duplicates embed.weight and would trip safetensors' shared-tensor check)."""
-    return {k: v.detach().cpu().contiguous()
-            for k, v in model.state_dict().items() if k != "lm_head.weight"}
+    return {
+        k: v.detach().cpu().contiguous()
+        for k, v in model.state_dict().items()
+        if k != "lm_head.weight"
+    }
 
 
 def _optim_tensors(opt) -> dict:
@@ -79,7 +82,8 @@ def load_resume(run_dir: str, model, opt, gen, device: str) -> int:
     path = os.path.join(run_dir, "last.safetensors")
     flat = load_file(path, device="cpu")
     model.load_state_dict(
-        {k: v for k, v in flat.items() if not k.startswith(("opt.", "rng."))}, strict=False
+        {k: v for k, v in flat.items() if not k.startswith(("opt.", "rng."))},
+        strict=False,
     )
     model.to(device)
     state: dict = {}
@@ -142,7 +146,9 @@ def build_optimizer(model, tcfg: TrainConfig):
     return torch.optim.AdamW(groups, lr=tcfg.lr, betas=(0.9, 0.95))
 
 
-def cosine_lr(step: int, total: int, base: float, warmup: int, min_ratio: float = 0.1) -> float:
+def cosine_lr(
+    step: int, total: int, base: float, warmup: int, min_ratio: float = 0.1
+) -> float:
     if step < warmup:
         return base * (step + 1) / warmup
     if step >= total:
@@ -164,16 +170,29 @@ def _parse_gpu_stats(csv_text: str) -> list[dict]:
         if not line.strip():
             continue
         idx, used, total, util = (p.strip() for p in line.split(","))
-        stats.append({"index": int(idx), "mem_used": int(used), "mem_total": int(total), "util": int(util)})
+        stats.append(
+            {
+                "index": int(idx),
+                "mem_used": int(used),
+                "mem_total": int(total),
+                "util": int(util),
+            }
+        )
     return stats
 
 
 def query_gpu_stats() -> list[dict]:
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total,utilization.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10, check=True,
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
         ).stdout
     except (FileNotFoundError, subprocess.SubprocessError):
         return []
@@ -231,7 +250,9 @@ def evaluate(model, val_ds: WindowedDataset, batch_size: int, device: str):
     return sum(losses) / max(1, len(losses))
 
 
-def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bool = False):
+def train(
+    model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bool = False
+):
     device = resolve_device(tcfg)
     if device.startswith("cuda") and ":" in device:
         torch.cuda.set_device(device)  # pin the chosen GPU for all allocations
@@ -241,33 +262,53 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bo
         torch.cuda.manual_seed_all(tcfg.seed)
     model, cfg = build_model(model_kind)
     model.to(device)
+    model.compile()
     n_params = count_params(model)
 
     run_dir = resolve_run_dir(model_kind, tcfg.seed, out)
     os.makedirs(run_dir, exist_ok=True)
     resuming = resume and os.path.exists(os.path.join(run_dir, "last.safetensors"))
     if os.path.isdir(run_dir) and any(os.scandir(run_dir)) and not resuming:
-        print(f"WARNING: run dir {run_dir} already contains files; they may be overwritten")
+        print(
+            f"WARNING: run dir {run_dir} already contains files; they may be overwritten"
+        )
     with open(os.path.join(run_dir, "metadata.json"), "w") as f:
         json.dump(
-            {"model": model_kind, "params": n_params, "device": device,
-             "model_config": asdict(cfg), "train_config": asdict(tcfg)},
-            f, indent=2, ensure_ascii=False,
+            {
+                "model": model_kind,
+                "params": n_params,
+                "device": device,
+                "model_config": asdict(cfg),
+                "train_config": asdict(tcfg),
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
         )
     print(f"model={model_kind} params={n_params:,} device={device} run_dir={run_dir}")
 
-    train_ds = WindowedDataset(os.path.join(tcfg.data_dir, "train.bin"), cfg.max_seq_len, tcfg.overlap)
+    train_ds = WindowedDataset(
+        os.path.join(tcfg.data_dir, "train.bin"), cfg.max_seq_len, tcfg.overlap
+    )
     val_path = os.path.join(tcfg.data_dir, "val.bin")
-    val_ds = WindowedDataset(val_path, cfg.max_seq_len, tcfg.overlap) if os.path.exists(val_path) else None
+    val_ds = (
+        WindowedDataset(val_path, cfg.max_seq_len, tcfg.overlap)
+        if os.path.exists(val_path)
+        else None
+    )
 
     n_windows = len(train_ds)
-    steps_per_epoch = math.ceil(n_windows / tcfg.batch_size)  # one optimizer step per batch
+    steps_per_epoch = math.ceil(
+        n_windows / tcfg.batch_size
+    )  # one optimizer step per batch
     total_steps = max(1, steps_per_epoch * tcfg.epochs)
     warmup = max(1, int(WARMUP_FRAC * total_steps))
 
     opt = build_optimizer(model, tcfg)
     use_amp = device.startswith("cuda")
-    gen = torch.Generator().manual_seed(tcfg.seed)  # dataset-shuffle RNG (independent of global seed)
+    gen = torch.Generator().manual_seed(
+        tcfg.seed
+    )  # dataset-shuffle RNG (independent of global seed)
 
     # best_ckpts: (val_loss, step, path) sorted ascending, len <= TOP_K_CKPTS.
     best_ckpts: list = []
@@ -276,8 +317,10 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bo
         start_epoch = load_resume(run_dir, model, opt, gen, device)
         best_path = os.path.join(run_dir, "best.json")
         if os.path.exists(best_path):
-            best_ckpts = [(r["val_loss"], r["step"], os.path.join(run_dir, r["file"]))
-                          for r in json.load(open(best_path))]
+            best_ckpts = [
+                (r["val_loss"], r["step"], os.path.join(run_dir, r["file"]))
+                for r in json.load(open(best_path))
+            ]
         print(f"resumed from last.safetensors at epoch {start_epoch}")
 
     # Append to the record on resume, truncate on a fresh run.
@@ -310,8 +353,16 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bo
 
     def save_last(resume_epoch: int):
         """Always-overwritten checkpoint with full state for resume-from-last."""
-        tensors = {**_model_tensors(model), **_optim_tensors(opt), **_rng_tensors(gen, device)}
-        meta = {"step": str(step), "resume_epoch": str(resume_epoch), "model": model_kind}
+        tensors = {
+            **_model_tensors(model),
+            **_optim_tensors(opt),
+            **_rng_tensors(gen, device),
+        }
+        meta = {
+            "step": str(step),
+            "resume_epoch": str(resume_epoch),
+            "model": model_kind,
+        }
         if last_val is not None:
             meta["val_loss"] = f"{last_val:.6f}"
         save_file(tensors, os.path.join(run_dir, "last.safetensors"), metadata=meta)
@@ -325,9 +376,16 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bo
         path = os.path.join(run_dir, f"step{step}.safetensors")
         if any(p == path for _, _, p in best_ckpts):
             return  # already saved this exact step
-        save_file(_model_tensors(model), path,
-                  metadata={"step": str(step), "epoch": str(epoch),
-                            "val_loss": f"{last_val:.6f}", "model": model_kind})
+        save_file(
+            _model_tensors(model),
+            path,
+            metadata={
+                "step": str(step),
+                "epoch": str(epoch),
+                "val_loss": f"{last_val:.6f}",
+                "model": model_kind,
+            },
+        )
         best_ckpts.append((last_val, step, path))
         best_ckpts.sort(key=lambda r: r[0])
         while len(best_ckpts) > TOP_K_CKPTS:
@@ -335,12 +393,23 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bo
             if os.path.exists(evict):
                 os.remove(evict)
         with open(os.path.join(run_dir, "best.json"), "w") as f:
-            json.dump([{"rank": i + 1, "step": s, "val_loss": vl, "file": os.path.basename(p)}
-                       for i, (vl, s, p) in enumerate(best_ckpts)], f, indent=2)
+            json.dump(
+                [
+                    {
+                        "rank": i + 1,
+                        "step": s,
+                        "val_loss": vl,
+                        "file": os.path.basename(p),
+                    }
+                    for i, (vl, s, p) in enumerate(best_ckpts)
+                ],
+                f,
+                indent=2,
+            )
 
     def checkpoint(epoch: int, resume_epoch: int):
-        save_best(epoch)          # top-K by val loss (model only)
-        save_last(resume_epoch)   # always: latest full state for resume
+        save_best(epoch)  # top-K by val loss (model only)
+        save_last(resume_epoch)  # always: latest full state for resume
         record_f.flush()
 
     try:
@@ -354,7 +423,11 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bo
             )
             for x, y in pbar:
                 x, y = x.to(device), y.to(device)
-                ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else _nullctx()
+                ctx = (
+                    torch.autocast("cuda", dtype=torch.bfloat16)
+                    if use_amp
+                    else _nullctx()
+                )
                 with ctx:
                     loss = loss_fn(model(x), y)
                 loss.backward()
@@ -363,17 +436,30 @@ def train(model_kind: str, tcfg: TrainConfig, out: str | None = None, resume: bo
                 did_val = val_ds is not None and step % VAL_EVERY == 0
                 if did_val:
                     last_val = evaluate(model, val_ds, tcfg.batch_size, device)
-                record(step=step, epoch=epoch, train_loss=last_loss,
-                       val_loss=last_val if did_val else None, time=time.time() - t0)
+                record(
+                    step=step,
+                    epoch=epoch,
+                    train_loss=last_loss,
+                    val_loss=last_val if did_val else None,
+                    time=time.time() - t0,
+                )
                 if did_val:
-                    checkpoint(epoch, resume_epoch=epoch)  # mid-epoch -> resume restarts this epoch
+                    checkpoint(
+                        epoch, resume_epoch=epoch
+                    )  # mid-epoch -> resume restarts this epoch
                 postfix(pbar, lr)
             pbar.close()
 
             # End-of-epoch validation + checkpoint (resume anchor = next epoch).
             if val_ds is not None:
                 last_val = evaluate(model, val_ds, tcfg.batch_size, device)
-            record(step=step, epoch=epoch, train_loss=last_loss, val_loss=last_val, time=time.time() - t0)
+            record(
+                step=step,
+                epoch=epoch,
+                train_loss=last_loss,
+                val_loss=last_val,
+                time=time.time() - t0,
+            )
             checkpoint(epoch, resume_epoch=epoch + 1)
             msg = f"epoch {epoch + 1}/{tcfg.epochs} done | train {last_loss:.4f}"
             if last_val is not None:
@@ -393,13 +479,28 @@ class _nullctx:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Train the baseline or GRACE model (shared TrainConfig).")
+    p = argparse.ArgumentParser(
+        description="Train the baseline or GRACE model (shared TrainConfig)."
+    )
     p.add_argument("--model", choices=["baseline", "grace"], required=True)
-    p.add_argument("--out", default=None, help="run directory (default ckpt/<model>/<seed>/)")
-    p.add_argument("--seed", type=int, default=0, help="RNG seed (for training multiple models)")
-    p.add_argument("--resume", action="store_true", help="resume from last.safetensors in the run dir")
+    p.add_argument(
+        "--out", default=None, help="run directory (default ckpt/<model>/<seed>/)"
+    )
+    p.add_argument(
+        "--seed", type=int, default=0, help="RNG seed (for training multiple models)"
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume from last.safetensors in the run dir",
+    )
     args = p.parse_args()
-    train(args.model, out=args.out, tcfg=replace(TrainConfig(), seed=args.seed), resume=args.resume)
+    train(
+        args.model,
+        out=args.out,
+        tcfg=replace(TrainConfig(), seed=args.seed),
+        resume=args.resume,
+    )
 
 
 if __name__ == "__main__":
