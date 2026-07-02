@@ -279,6 +279,9 @@ def train(
     device = resolve_device(tcfg)
     if device.startswith("cuda") and ":" in device:
         torch.cuda.set_device(device)  # pin the chosen GPU for all allocations
+    # TF32 tensor cores for the fp32 matmuls that run OUTSIDE the bf16 autocast
+    # (validation in evaluate()); applies to both models equally.
+    torch.set_float32_matmul_precision("high")
     # Seed BEFORE build_model so weight init (nn.init.normal_) is reproducible per seed.
     seed_all(tcfg.seed, device)
     model, cfg = build_model(model_kind)

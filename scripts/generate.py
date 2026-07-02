@@ -209,6 +209,9 @@ def main():
     device = resolve_device(TrainConfig(device=args.device))
     if device.startswith("cuda") and ":" in device:
         torch.cuda.set_device(device)
+    # TF32 tensor cores for fp32 matmuls (the --dtype f32 path; no effect on
+    # f16/bf16/int8). Same setting as training, applied to both models equally.
+    torch.set_float32_matmul_precision("high")
 
     tok = GraceTokenizer()
     model, cfg = load_model(args.ckpt_path, device)
