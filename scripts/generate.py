@@ -22,9 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn.functional as F
 
-from grace.config import TrainConfig
+from grace.config import PRESETS, TrainConfig
 from grace.tokenizer import GraceTokenizer
-from grace.train import model_family, resolve_device, seed_all
+from grace.train import build_model, model_family, resolve_device, seed_all
 
 
 def config_from_metadata(meta: dict):
@@ -194,8 +194,14 @@ def main():
     p = argparse.ArgumentParser(description="Generate text from a trained checkpoint.")
     p.add_argument(
         "--ckpt-path",
-        required=True,
         help="path to a .safetensors checkpoint (metadata.json must sit beside it)",
+    )
+    p.add_argument(
+        "--fake",
+        choices=[k for k in PRESETS if not k.endswith("_tiny")],
+        help="benchmark a preset with random weights instead of loading a "
+        "checkpoint — decode/prefill speed doesn't depend on weight values, "
+        "so untrained presets can be measured (output text is gibberish)",
     )
     p.add_argument(
         "--prompt",
@@ -240,6 +246,8 @@ def main():
         "int8 = torchao weight-only quant over bf16 activations (CUDA recommended)",
     )
     args = p.parse_args()
+    if (args.ckpt_path is None) == (args.fake is None):
+        p.error("exactly one of --ckpt-path or --fake is required")
 
     seeds = args.seed
     device = resolve_device(TrainConfig(device=args.device))
@@ -250,7 +258,12 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     tok = GraceTokenizer()
-    model, cfg = load_model(args.ckpt_path, device)
+    if args.fake:
+        torch.manual_seed(0)  # reproducible random init
+        model, cfg = build_model(args.fake)
+        model.to(device).eval()
+    else:
+        model, cfg = load_model(args.ckpt_path, device)
 
     # Cast BEFORE compile so kernels are generated for the final dtype. The KV
     # cache and pool buffer inherit the activation dtype, so f16/bf16 also halve

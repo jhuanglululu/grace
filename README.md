@@ -136,7 +136,10 @@ model, printing per-seed stats and a pooled tok/s average), `--show-output`
 `--temperature`, `--top-k`,
 `--max-new-tokens`, `--device`, `--compile` (auto/on/off — torch.compile both
 models; auto = on for CUDA, and the biggest lever on the decode numbers), and
-`--dtype` (`f32` default | `f16` | `bf16` | `int8`). Below-f32 dtypes shrink
+`--dtype` (`f32` default | `f16` | `bf16` | `int8`). To benchmark a preset
+that hasn't been trained, pass `--fake <preset>` instead of `--ckpt-path` —
+it builds the model with random weights in memory (tok/s doesn't depend on
+weight values; the sampled text is gibberish). Below-f32 dtypes shrink
 weight and KV-cache traffic — the main bottleneck at batch-1 — and sampling
 always runs in fp32. `int8` is torchao weight-only quantization over bf16
 activations (CUDA recommended; the tied embedding stays bf16). Checkpoints
