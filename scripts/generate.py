@@ -298,8 +298,9 @@ def main():
     # args and length, not a shortened pass. Every one-time cost (compile,
     # dynamic-shape recompiles at KV-cache lengths a short warmup never reaches,
     # allocator pool growth, kernel autotune) must land here, or it pollutes the
-    # first seed's numbers and skews the pooled average.
-    seed_all(0, device)
+    # first seed's numbers and skews the pooled average. Seeding with seeds[0]
+    # makes the warmup a bit-identical rehearsal of the first timed run.
+    seed_all(seeds[0], device)
     generate_ids(
         model, prompt_ids, max_new_tokens=args.max_new_tokens, warn=False, **common
     )
