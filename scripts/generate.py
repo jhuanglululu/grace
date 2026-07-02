@@ -267,6 +267,14 @@ def main():
         model = model.to(torch.bfloat16)
         quantize_(model, Int8WeightOnlyConfig(version=2))
 
+    # The models build their RoPE cos/sin table lazily inside the first forward
+    # (_rope_cache starts as None). Populate it eagerly BEFORE compiling, or the
+    # first compiled prefill traces the cache-building branch and guards on
+    # `self._rope_cache is None` — a guard the NEXT prefill fails, recompiling
+    # (~1.4s) inside the first seed's timed prefill.
+    with torch.no_grad():
+        model(torch.zeros((1, 1), dtype=torch.long, device=device))
+
     # Fuse the many small ops (norms, softmax, rope, depth-attention) into few
     # kernels. This is where GRACE's fewer-layers advantage shows up: eager launch
     # overhead otherwise dominates at batch-1. Applied to both models so the
