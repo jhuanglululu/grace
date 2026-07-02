@@ -26,6 +26,7 @@ from grace.config import TrainConfig
 from grace.tokenizer import GraceTokenizer
 from grace.train import model_family, resolve_device, seed_all
 
+
 def config_from_metadata(meta: dict):
     """Rebuild the (ModelClass, config) pair from a run's metadata.json.
     Kind dispatch lives in grace.train.model_family — one source of truth."""
@@ -69,8 +70,12 @@ def apply_rep_pen(logits: torch.Tensor, prev_ids, pen: float) -> torch.Tensor:
     return logits
 
 
-def _sample(logits: torch.Tensor, prev_ids, temperature: float, top_k: int, rep_pen: float) -> int:
-    logits = logits.float()  # sample in fp32 regardless of model dtype (8k vocab — cheap)
+def _sample(
+    logits: torch.Tensor, prev_ids, temperature: float, top_k: int, rep_pen: float
+) -> int:
+    logits = (
+        logits.float()
+    )  # sample in fp32 regardless of model dtype (8k vocab — cheap)
     logits = apply_rep_pen(logits, prev_ids, rep_pen)
     if temperature <= 0:  # greedy
         return int(logits.argmax())
@@ -125,14 +130,20 @@ def generate_ids(
     """
     ids = list(prompt_ids)
     if len(ids) >= max_seq_len:  # keep room to generate at least one token
-        ids = ids[-(max_seq_len - 1):]
+        ids = ids[-(max_seq_len - 1) :]
         if warn:
-            print(f"warning: prompt truncated to its last {len(ids)} tokens "
-                  f"(max_seq_len={max_seq_len})", file=sys.stderr)
+            print(
+                f"warning: prompt truncated to its last {len(ids)} tokens "
+                f"(max_seq_len={max_seq_len})",
+                file=sys.stderr,
+            )
     room = max_seq_len - len(ids)
     if warn and room < max_new_tokens:
-        print(f"warning: context window leaves room for only {room} of "
-              f"{max_new_tokens} requested tokens", file=sys.stderr)
+        print(
+            f"warning: context window leaves room for only {room} of "
+            f"{max_new_tokens} requested tokens",
+            file=sys.stderr,
+        )
     caches = model.init_kv_cache()
 
     ctx = torch.tensor([ids], dtype=torch.long, device=device)
@@ -181,24 +192,53 @@ def generate_ids(
 
 def main():
     p = argparse.ArgumentParser(description="Generate text from a trained checkpoint.")
-    p.add_argument("--ckpt-path", required=True, help="path to a .safetensors checkpoint (metadata.json must sit beside it)")
-    p.add_argument("--prompt", default="", help="conditioning text (empty => start from a doc boundary)")
-    p.add_argument("--rep-pen", type=float, default=1.1, help="repetition penalty (1.0 = off)")
-    p.add_argument("--seed", type=_seed_list, default=[0],
-                   help="random seed, or comma-separated list (e.g. 0,42,67): each seed "
-                        "generates once from the same loaded/quantized/compiled model, "
-                        "with per-seed stats plus a pooled average")
-    p.add_argument("--show-output", action="store_true",
-                   help="print the generated text (default: statistics only)")
+    p.add_argument(
+        "--ckpt-path",
+        required=True,
+        help="path to a .safetensors checkpoint (metadata.json must sit beside it)",
+    )
+    p.add_argument(
+        "--prompt",
+        default="",
+        help="conditioning text (empty => start from a doc boundary)",
+    )
+    p.add_argument(
+        "--rep-pen", type=float, default=1.1, help="repetition penalty (1.0 = off)"
+    )
+    p.add_argument(
+        "--seed",
+        type=_seed_list,
+        default=[0],
+        help="random seed, or comma-separated list (e.g. 0,42,67): each seed "
+        "generates once from the same loaded/quantized/compiled model, "
+        "with per-seed stats plus a pooled average",
+    )
+    p.add_argument(
+        "--show-output",
+        action="store_true",
+        help="print the generated text (default: statistics only)",
+    )
     p.add_argument("--max-new-tokens", type=int, default=200)
     p.add_argument("--temperature", type=float, default=0.8, help="0 => greedy")
     p.add_argument("--top-k", type=int, default=50, help="0 => no top-k")
-    p.add_argument("--device", default=None, help="default: auto-pick a free GPU (see train.resolve_device)")
-    p.add_argument("--compile", choices=["auto", "on", "off"], default="auto",
-                   help="torch.compile the model to fuse kernels (auto = on for CUDA)")
-    p.add_argument("--dtype", choices=["f32", "f16", "bf16", "int8"], default="f32",
-                   help="weight/activation precision; halves KV-cache traffic below f32. "
-                        "int8 = torchao weight-only quant over bf16 activations (CUDA recommended)")
+    p.add_argument(
+        "--device",
+        default=None,
+        help="default: auto-pick a free GPU (see train.resolve_device)",
+    )
+    p.add_argument(
+        "--compile",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="torch.compile the model to fuse kernels (auto = on for CUDA)",
+    )
+    p.add_argument(
+        "--dtype",
+        choices=["f32", "f16", "bf16", "int8"],
+        default="f32",
+        help="weight/activation precision; halves KV-cache traffic below f32. "
+        "int8 = torchao weight-only quant over bf16 activations (CUDA recommended)",
+    )
     args = p.parse_args()
 
     seeds = args.seed
@@ -232,7 +272,9 @@ def main():
     # overhead otherwise dominates at batch-1. Applied to both models so the
     # comparison is architecture, not compile-vs-eager. The warmup below absorbs
     # the one-time compile cost.
-    do_compile = args.compile == "on" or (args.compile == "auto" and device.startswith("cuda"))
+    do_compile = args.compile == "on" or (
+        args.compile == "auto" and device.startswith("cuda")
+    )
     if do_compile:
         # dynamic=True: compile once for a dynamic sequence/position rather than
         # relying on automatic-dynamic to engage as start_pos and the KV-cache
@@ -245,8 +287,11 @@ def main():
         prompt_ids = [tok.eos_id if tok.eos_id is not None else (tok.bos_id or 0)]
 
     common = dict(
-        temperature=args.temperature, top_k=args.top_k, rep_pen=args.rep_pen,
-        max_seq_len=cfg.max_seq_len, device=device,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        rep_pen=args.rep_pen,
+        max_seq_len=cfg.max_seq_len,
+        device=device,
     )
 
     # Warm up with a full untimed replica of a timed run — identical sampling
@@ -254,17 +299,31 @@ def main():
     # dynamic-shape recompiles at KV-cache lengths a short warmup never reaches,
     # allocator pool growth, kernel autotune) must land here, or it pollutes the
     # first seed's numbers and skews the pooled average.
-    generate_ids(model, prompt_ids, max_new_tokens=args.max_new_tokens,
-                 warn=False, **common)
+    seed_all(seed, device)
+    generate_ids(
+        model, prompt_ids, max_new_tokens=args.max_new_tokens, warn=False, **common
+    )
 
     # One generation per seed, re-seeding before each so every --seed value
     # determines its own output; the model stays loaded/quantized/compiled.
-    totals = {"prefill_tokens": 0, "prefill_time": 0.0, "decode_tokens": 0,
-              "decode_time": 0.0, "new_tokens": 0, "sample_time": 0.0}
+    totals = {
+        "prefill_tokens": 0,
+        "prefill_time": 0.0,
+        "decode_tokens": 0,
+        "decode_time": 0.0,
+        "new_tokens": 0,
+        "sample_time": 0.0,
+    }
     for i, seed in enumerate(seeds):
         seed_all(seed, device)
-        gen_ids, s = generate_ids(model, prompt_ids, max_new_tokens=args.max_new_tokens,
-                                  return_timing=True, warn=(i == 0), **common)
+        gen_ids, s = generate_ids(
+            model,
+            prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            return_timing=True,
+            warn=(i == 0),
+            **common,
+        )
         for k in totals:
             totals[k] += s[k]
 
@@ -291,7 +350,11 @@ def main():
     if len(seeds) > 1:
         # Pooled (total tokens / total time), not a mean of rates — robust to
         # runs of different lengths (a prompt near max_seq_len leaves less room).
-        pt, dt, st = totals["prefill_time"], totals["decode_time"], totals["sample_time"]
+        pt, dt, st = (
+            totals["prefill_time"],
+            totals["decode_time"],
+            totals["sample_time"],
+        )
         print(
             f"\n[average over {len(seeds)} seeds (pooled): "
             f"prefill {_rate(totals['prefill_tokens'], pt):.1f} tok/s | "
