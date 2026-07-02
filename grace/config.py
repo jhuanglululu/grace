@@ -3,11 +3,12 @@
 The presets are **block-matched**: all three models are built from the same 24
 blocks (12 attn + 12 mlp) with identical dimensions (d_model=512, d_ff=1472,
 8 heads); they differ only in how those blocks are wired. 24 was chosen
-because it divides by 2 and 3, giving a **flattening sweep** at fixed blocks:
+because it divides by 2, 3, and 4, giving a **flattening sweep** at fixed blocks:
 
 - ``baseline`` — the 24 blocks chained sequentially (12 layers x [attn, mlp]).
 - ``grace2``   — the same stack flattened 2-wide: 12 alternating layers x 2 groups.
 - ``grace3``   — flattened 3-wide: 8 alternating layers x 3 groups.
+- ``grace4``   — flattened 4-wide: 6 alternating layers x 4 groups.
 
 Each GRACE variant adds only its zero-init depth-attention queries (<0.05% of
 params), so all three land at ~44M params matched to <0.05% with matmul
@@ -119,6 +120,7 @@ PRESETS: dict[str, object] = {
     "baseline": BaselineConfig(),  # 12 sequential layers = 24 sublayers
     "grace2": GraceConfig(),  # 2-wide: 12 layers x 2 groups = 24 blocks
     "grace3": GraceConfig(groups=3, layer_types=["attn", "mlp"] * 4),  # 3-wide: 8 layers x 3 groups
+    "grace4": GraceConfig(groups=4, layer_types=["attn", "mlp"] * 3),  # 4-wide: 6 layers x 4 groups
     # Tiny configs used by the test-suite for fast CPU verification.
     "baseline_tiny": BaselineConfig(
         vocab_size=64, d_model=32, n_layer=3, n_head=4, d_ff=48, max_seq_len=32

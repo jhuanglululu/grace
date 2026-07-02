@@ -22,13 +22,14 @@ See [`claude.md`](claude.md) for the architecture rationale.
 
 The presets are **block-matched**: all three models are built from the same 24
 blocks (12 attn + 12 mlp, d_model=512, d_ff=1472) and differ only in wiring —
-a **flattening sweep** (24 divides by 2 and 3):
+a **flattening sweep** (24 divides by 2, 3, and 4):
 
 | preset | wiring | depth |
 |--------|--------|-------|
 | `baseline` | 24 blocks chained sequentially | 12 layers × [attn, mlp] |
 | `grace2` | flattened 2-wide | 12 alternating layers × 2 groups |
 | `grace3` | flattened 3-wide | 8 alternating layers × 3 groups |
+| `grace4` | flattened 4-wide | 6 alternating layers × 4 groups |
 
 Each GRACE variant adds only its zero-init depth-attention queries, so all
 three are ~44M params (matched to <0.05%) with FLOPs/token within ~1% — the
