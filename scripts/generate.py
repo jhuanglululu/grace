@@ -26,10 +26,6 @@ from grace.config import TrainConfig
 from grace.tokenizer import GraceTokenizer
 from grace.train import model_family, resolve_device, seed_all
 
-# Tokens generated in the untimed warmup pass (exercises prefill + decode kernels).
-WARMUP_TOKENS = 8
-
-
 def config_from_metadata(meta: dict):
     """Rebuild the (ModelClass, config) pair from a run's metadata.json.
     Kind dispatch lives in grace.train.model_family — one source of truth."""
@@ -253,13 +249,13 @@ def main():
         max_seq_len=cfg.max_seq_len, device=device,
     )
 
-    # Warm up (compile + kernel autotune / allocation) so the timed run measures
-    # steady state, guaranteeing the decode shape is compiled before timing.
-    generate_ids(
-        model, prompt_ids, max_new_tokens=WARMUP_TOKENS,
-        temperature=0.0, top_k=0, rep_pen=1.0,
-        max_seq_len=cfg.max_seq_len, device=device, warn=False,
-    )
+    # Warm up with a full untimed replica of a timed run — identical sampling
+    # args and length, not a shortened pass. Every one-time cost (compile,
+    # dynamic-shape recompiles at KV-cache lengths a short warmup never reaches,
+    # allocator pool growth, kernel autotune) must land here, or it pollutes the
+    # first seed's numbers and skews the pooled average.
+    generate_ids(model, prompt_ids, max_new_tokens=args.max_new_tokens,
+                 warn=False, **common)
 
     # One generation per seed, re-seeding before each so every --seed value
     # determines its own output; the model stays loaded/quantized/compiled.

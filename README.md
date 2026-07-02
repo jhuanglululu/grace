@@ -113,9 +113,10 @@ uv run scripts/generate.py --ckpt-path ckpt/grace2/0/last.safetensors \
 ```
 
 Generation uses a **KV cache** (prefill the prompt, then O(1)-attention single-
-token steps). It runs an untimed **warmup** pass first (so kernel autotune /
-allocation don't skew the numbers), re-seeds, then reports **prefill and decode
-tok/s separately** — prefill is parallel prompt ingestion, decode is sequential
+token steps). It first runs a full-length untimed **warmup** generation with the
+same settings (so one-time costs — compile, recompiles, autotune, allocation —
+land there instead of polluting the first seed), re-seeds, then reports
+**prefill and decode tok/s separately** — prefill is parallel prompt ingestion, decode is sequential
 single-token throughput:
 
 ```
